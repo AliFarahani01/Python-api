@@ -14,11 +14,9 @@ def home():
 def run_code():
     code = request.args.get('code') if request.method == 'GET' else request.json.get('code', '')
     
-    # خالی بودن کد
     if not code:
         return jsonify({'success': False, 'output': 'هیچ کدی ارسال نشده.'}), 400
 
-    # اجرای کد
     try:
         old_stdout = sys.stdout
         redirected_output = sys.stdout = io.StringIO()
