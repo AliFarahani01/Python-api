@@ -1,51 +1,44 @@
 from flask import Flask, request, jsonify
 import sys
 import io
-import time
 import traceback
+import time
 
 app = Flask(__name__)
 
 @app.route('/')
 def home():
-    return "API اجرای کامل پایتون فعاله."
+    return 'API فعاله! آماده اجرای کد پایتون.'
 
-@app.route('/run', methods=['POST'])
+@app.route('/run', methods=['GET', 'POST'])
 def run_code():
+    code = request.args.get('code') if request.method == 'GET' else request.json.get('code', '')
+    
+    # خالی بودن کد
+    if not code:
+        return jsonify({'success': False, 'output': 'هیچ کدی ارسال نشده.'}), 400
+
+    # اجرای کد
     try:
-        data = request.get_json(force=True)
-        code = data.get("code", "")
-
-        if not code:
-            return jsonify({"success": False, "error": "هیچ کدی ارسال نشده است."}), 400
-
-        # گرفتن خروجی
         old_stdout = sys.stdout
         redirected_output = sys.stdout = io.StringIO()
 
-        start_time = time.time()
+        start = time.time()
+        exec(code, {})
+        exec_time = (time.time() - start) * 1000
 
-        try:
-            exec(code, globals())  # اجرای کامل بدون محدودیت
-            output = redirected_output.getvalue()
-            success = True
-        except Exception:
-            output = traceback.format_exc()
-            success = False
-        finally:
-            sys.stdout = old_stdout
-
-        exec_time = round((time.time() - start_time) * 1000, 2)
+        output = redirected_output.getvalue()
+        sys.stdout = old_stdout
 
         return jsonify({
-            "success": success,
-            "output": output.strip(),
-            "exec_time_ms": exec_time
+            'success': True,
+            'output': output.strip(),
+            'exec_time_ms': round(exec_time, 2)
         })
 
-    except Exception as e:
-        return jsonify({"success": False, "error": str(e)}), 500
-
-
-if __name__ == '__main__':
-    app.run()
+    except Exception:
+        sys.stdout = old_stdout
+        return jsonify({
+            'success': False,
+            'output': traceback.format_exc()
+        }), 500
