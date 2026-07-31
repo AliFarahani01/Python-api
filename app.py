@@ -542,7 +542,7 @@ class TelegramBotManager:
             "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
             "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
             buttons=[
-              #[Button.url("🚀 Open Web App", web_app_url)],
+              [Button.url("🚀 Open Web App", web_app_url)],
                 # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
                  [Button.web_app("🚀 Open Mini App", web_app_url)]
             ]
