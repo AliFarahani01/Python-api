@@ -560,8 +560,7 @@ class TelegramBotManager:
         from telethon import Button
         await event.respond(
             "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n"
-            "💡 **Tip:** Send `/setmenu` to add a permanent Mini App button to your chat menu.",
+            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n",
             buttons=[
                 [Button.web_app("🚀 Open Mini App", web_app_url)]
             ]
@@ -577,8 +576,7 @@ class TelegramBotManager:
         
         await event.respond(
             "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n"
-            "💡 **Tip:** Send `/setmenu` to add a permanent Mini App button to your chat menu.",
+            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n",
             buttons=[
                 [KeyboardButtonWebView(text="🚀 Open Mini App", url=web_app_url)]
             ]
