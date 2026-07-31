@@ -535,7 +535,7 @@ class TelegramBotManager:
         self.user_states[user_id] = {"state": BotStates.PHONE}
         
         # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
+        web_app_url = "https://python-api-1-c4y7.onrender.com/" # اینجا را با آدرس واقعی خود جایگزین کنید
         
         from telethon import Button
         await event.respond(
