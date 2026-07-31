@@ -482,7 +482,6 @@ auth_manager = TelegramAuthManager()
 # ============================================================================
 # 7. TELEGRAM BOT INTEGRATION
 # ============================================================================
-
 class BotStates:
     PHONE = "PHONE"
     CODE = "CODE"
@@ -516,6 +515,9 @@ class TelegramBotManager:
                 elif text == '/cancel':
                     await self.cmd_cancel(event, user_id)
                     return
+                elif text == '/setmenu':
+                    await self.cmd_set_menu(event, user_id)
+                    return
 
                 state_data = self.user_states.get(user_id)
                 if not state_data:
@@ -532,19 +534,35 @@ class TelegramBotManager:
         except Exception as e:
             log.error(f"Bot startup error: {e}", exc_info=True)
 
+    async def cmd_set_menu(self, event, user_id: int):
+        web_app_url = "https://python-api-1-c4y7.onrender.com/"
+        try:
+            from telethon.tl.functions.bots import SetBotMenuButtonRequest
+            from telethon.tl.types import BotMenuButton
+            
+            await self.client(SetBotMenuButtonRequest(
+                user_id=user_id,
+                button=BotMenuButton(
+                    text="🚀 Open App",
+                    url=web_app_url
+                )
+            ))
+            await event.respond("✅ Menu button set successfully! Check the bottom left corner of your chat.")
+        except Exception as e:
+            await event.respond(f"❌ Error setting menu: {str(e)}")
+
     async def cmd_start(self, event, user_id: int):
         self.user_states[user_id] = {"state": BotStates.PHONE}
         
         # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://python-api-1-c4y7.onrender.com/" # اینجا را با آدرس واقعی خود جایگزین کنید
+        web_app_url = "https://python-api-1-c4y7.onrender.com/" 
         
         from telethon import Button
         await event.respond(
             "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
+            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n"
+            "💡 **Tip:** Send `/setmenu` to add a permanent Mini App button to your chat menu.",
             buttons=[
-                #[Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
                 [Button.web_app("🚀 Open Mini App", web_app_url)]
             ]
         )
@@ -634,7 +652,6 @@ class TelegramBotManager:
         await client.disconnect()
 
 bot_manager = TelegramBotManager(settings.TOKEN_BOT)
-
 # ============================================================================
 # 8. FASTAPI APPLICATION & MIDDLEWARES
 # ============================================================================
