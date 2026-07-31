@@ -531,22 +531,7 @@ class TelegramBotManager:
 
         except Exception as e:
             log.error(f"Bot startup error: {e}", exc_info=True)
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://python-api-1-c4y7.onrender.com/" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-              [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                 #[Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
+
     async def cmd_start(self, event, user_id: int):
         self.user_states[user_id] = {"state": BotStates.PHONE}
         
@@ -561,102 +546,6 @@ class TelegramBotManager:
                 #[Button.url("🚀 Open Web App", web_app_url)],
                 # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
                 [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-                [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                # [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-                [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                # [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-                [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                # [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-                [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                # [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-                [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                # [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://your-domain.com" # اینجا را با آدرس واقعی خود جایگزین کنید
-        
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.",
-            buttons=[
-                [Button.url("🚀 Open Web App", web_app_url)],
-                # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                # [Button.web_app("🚀 Open Mini App", web_app_url)]
             ]
         )
 
