@@ -544,7 +544,7 @@ class TelegramBotManager:
             buttons=[
               [Button.url("🚀 Open Web App", web_app_url)],
                 # اگر خواستید دکمه مستقیم مینی‌اپ تلگرام باز شود (بدون باز شدن مرورگر) از خط زیر استفاده کنید:
-                 [Button.web_app("🚀 Open Mini App", web_app_url)]
+                 #[Button.web_app("🚀 Open Mini App", web_app_url)]
             ]
         )
     async def cmd_start(self, event, user_id: int):
