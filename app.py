@@ -566,7 +566,23 @@ class TelegramBotManager:
                 [Button.web_app("🚀 Open Mini App", web_app_url)]
             ]
         )
-
+    async def cmd_start(self, event, user_id: int):
+        self.user_states[user_id] = {"state": BotStates.PHONE}
+        
+        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
+        web_app_url = "https://python-api-1-c4y7.onrender.com/" 
+        
+        # استفاده از KeyboardButtonWebView برای سازگاری با تمام نسخه‌های Telethon
+        from telethon.tl.types import KeyboardButtonWebView
+        
+        await event.respond(
+            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
+            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n"
+            "💡 **Tip:** Send `/setmenu` to add a permanent Mini App button to your chat menu.",
+            buttons=[
+                [KeyboardButtonWebView(text="🚀 Open Mini App", url=web_app_url)]
+            ]
+        )
     async def cmd_cancel(self, event, user_id: int):
         if user_id in self.user_states:
             state = self.user_states[user_id]
