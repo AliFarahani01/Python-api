@@ -1,1 +1,6 @@
-
+fastapi
+uvicorn[standard]
+telethon
+pydantic
+pydantic-settings
+python-multipart
