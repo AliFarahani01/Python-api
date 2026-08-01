@@ -486,7 +486,6 @@ class BotStates:
     PHONE = "PHONE"
     CODE = "CODE"
     PASSWORD = "PASSWORD"
-
 class TelegramBotManager:
     def __init__(self, token: str):
         self.token = token
@@ -495,23 +494,32 @@ class TelegramBotManager:
         
         # ==========================================
         # تنظیمات جوین اجباری (Force Join)
-        # یوزرنیم کانال خود را بدون @ وارد کنید. مثلا: "ProShopChannel"
-        # اگر نمی‌خواهید جوین اجباری باشد، مقدار را خالی "" بگذارید.
-        self.required_channel = "ProShopChannel" 
+        # یوزرنیم کانال‌ها را بدون @ در لیست زیر وارد کنید.
+        # اگر نمی‌خواهید جوین اجباری باشد، لیست را خالی بگذارید: []
+        self.required_channels = [
+            "ProShopChannel", 
+            "ProShopNews",
+            "ProShopSupport"
+        ] 
         # ==========================================
 
-    async def check_membership(self, user_id: int) -> bool:
-        """بررسی می‌کند که آیا کاربر در کانال مورد نظر عضو است یا خیر"""
-        if not self.required_channel:
-            return True
+    async def check_membership(self, user_id: int) -> tuple:
+        """
+        بررسی می‌کند که آیا کاربر در تمام کانال‌های مورد نظر عضو است یا خیر.
+        خروجی: (وضعیت عضویت, لیست کانال‌هایی که در آن‌ها عضو نیست)
+        """
+        if not self.required_channels:
+            return True, []
             
-        try:
-            participant = await self.client.get_participant(self.required_channel, user_id)
-            # اگر کاربر عضو باشد یا ادمین باشد، خطا نمی‌دهد
-            return True
-        except Exception:
-            # اگر کاربر عضو نباشد یا کانال پیدا نشود
-            return False
+        missing_channels = []
+        for channel in self.required_channels:
+            try:
+                await self.client.get_participant(channel, user_id)
+            except Exception:
+                missing_channels.append(channel)
+                
+        is_member = len(missing_channels) == 0
+        return is_member, missing_channels
 
     async def start(self):
         if not settings.ENABLE_BOT: return
@@ -532,16 +540,19 @@ class TelegramBotManager:
 
                 # -----------------------------------------------------
                 # ۱. بررسی جوین اجباری قبل از انجام هر کاری
-                if not await self.check_membership(user_id):
+                is_member, missing_channels = await self.check_membership(user_id)
+                if not is_member:
                     from telethon import Button
-                    channel_link = f"https://t.me/{self.required_channel}"
+                    # ساخت دکمه‌ها برای کانال‌هایی که کاربر هنوز در آن‌ها عضو نشده است
+                    buttons = []
+                    for ch in missing_channels:
+                        buttons.append([Button.url(f"📢 Join {ch}", f"https://t.me/{ch}")])
+                    
                     await event.respond(
                         "🔒 **Access Restricted**\n\n"
-                        "To use this bot, you must join our official channel first.\n"
-                        "Please join and then send /start again.",
-                        buttons=[
-                            [Button.url("📢 Join Channel", channel_link)]
-                        ]
+                        "To use this bot, you must join all our official channels first.\n"
+                        "Please join the channels below and then send /start again.",
+                        buttons=buttons
                     )
                     return # جلوی ادامه کار کاربر گرفته می‌شود
                 # -----------------------------------------------------
@@ -708,7 +719,6 @@ class TelegramBotManager:
         }
         await db.add_user(user_data)
         await client.disconnect()
-
 bot_manager = TelegramBotManager(settings.TOKEN_BOT)
 # ============================================================================
 # 8. FASTAPI APPLICATION & MIDDLEWARES
