@@ -4,3 +4,4 @@ telethon
 pydantic
 pydantic-settings
 python-multipart
+aiosqlite
