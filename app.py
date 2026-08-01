@@ -1,26 +1,28 @@
-
 """
 Pro Shop Ultimate Enterprise Telegram Airdrop & Authentication Platform
 Single-file production-grade build.
 
-Stack:
+Stack
+-----
 - FastAPI + Uvicorn
-- Telethon (Userbot MTProto + Bot)
-- aiosqlite
-- JWT sessions (python-jose)
-- bcrypt admin hashing
-- Repository pattern
-- WebSocket leaderboard
+- Telethon (MTProto User + Bot)
+- Async SQLite (aiosqlite)
+- JWT Authentication
+- Repository Pattern
+- WebSocket
 - Vanilla JS SPA
 """
 
 from __future__ import annotations
 
+# ==========================
+# Standard Library
+# ==========================
+
 import asyncio
 import base64
 import contextlib
 import dataclasses
-from dataclasses import dataclass, field
 import enum
 import hashlib
 import html
@@ -32,26 +34,97 @@ import secrets
 import shutil
 import string
 import time
+
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, AsyncIterator, Callable, Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import (
+    Any,
+    AsyncIterator,
+    Callable,
+    Dict,
+    Iterable,
+    List,
+    Optional,
+    Sequence,
+    Tuple,
+)
+
+# ==========================
+# Third Party
+# ==========================
 
 import aiosqlite
-from fastapi import BackgroundTasks, Cookie, Depends, FastAPI, HTTPException, Query, Request, Response, WebSocket, WebSocketDisconnect
+
+from fastapi import (
+    BackgroundTasks,
+    Body,
+    Cookie,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    Header,
+    HTTPException,
+    Path,
+    Query,
+    Request,
+    Response,
+    UploadFile,
+    WebSocket,
+    WebSocketDisconnect,
+    status,
+)
+
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse
+
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    JSONResponse,
+    PlainTextResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
+
+from fastapi.security import (
+    APIKeyHeader,
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+    OAuth2PasswordBearer,
+)
+
 from jose import JWTError, jwt
+
 from pydantic import BaseModel, Field
-from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from pydantic_settings import (
+    BaseSettings,
+    SettingsConfigDict,
+)
+
 from starlette.middleware.base import BaseHTTPMiddleware
+
+# ==========================
+# Optional Dependencies
+# ==========================
 
 try:
     import bcrypt
-except Exception as exc:  # pragma: no cover
-    bcrypt = None  # type: ignore[assignment]
+except ImportError:
+    bcrypt = None
+
+# ==========================
+# Telethon
+# ==========================
 
 try:
-    from telethon import Button, TelegramClient, events
+    from telethon import (
+        Button,
+        TelegramClient,
+        events,
+    )
+
     from telethon.errors import (
         FloodWaitError,
         PhoneCodeExpiredError,
@@ -60,21 +133,37 @@ try:
         SessionPasswordNeededError,
         UserNotParticipantError,
     )
-    from telethon.tl.types import KeyboardButtonWebView, User
-except Exception:  # pragma: no cover
-    TelegramClient = Any  # type: ignore[misc,assignment]
-    events = None  # type: ignore[assignment]
-    Button = None  # type: ignore[assignment]
-    KeyboardButtonWebView = Any  # type: ignore[assignment]
-    User = Any  # type: ignore[assignment]
-    FloodWaitError = Exception  # type: ignore[assignment]
-    PhoneCodeExpiredError = Exception  # type: ignore[assignment]
-    PhoneCodeInvalidError = Exception  # type: ignore[assignment]
-    PhoneNumberBannedError = Exception  # type: ignore[assignment]
-    SessionPasswordNeededError = Exception  # type: ignore[assignment]
-    UserNotParticipantError = Exception  # type: ignore[assignment]
 
+    from telethon.tl.types import (
+        KeyboardButtonWebView,
+        User,
+    )
 
+except ImportError:
+
+    TelegramClient = Any
+    Button = Any
+    events = Any
+    KeyboardButtonWebView = Any
+    User = Any
+
+    FloodWaitError = Exception
+    PhoneCodeExpiredError = Exception
+    PhoneCodeInvalidError = Exception
+    PhoneNumberBannedError = Exception
+    SessionPasswordNeededError = Exception
+    UserNotParticipantError = Exception
+
+# ==========================
+# Logger
+# ==========================
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+)
+
+logger = logging.getLogger("proshop")
 # =============================================================================
 # Configuration
 # =============================================================================
