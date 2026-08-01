@@ -66,7 +66,6 @@ from fastapi import (
     Form,
     Header,
     HTTPException,
-    Path,
     Query,
     Request,
     Response,
