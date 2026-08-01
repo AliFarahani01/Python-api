@@ -478,10 +478,10 @@ class TelegramAuthManager:
         return {"status": "success", "message": "Login successful.", "user": user_data}
 
 auth_manager = TelegramAuthManager()
+# ============================================================================
+# 7. TELEGRAM BOT INTEGRATION (Professional & Force-Join Enabled)
+# ============================================================================
 
-# ============================================================================
-# 7. TELEGRAM BOT INTEGRATION
-# ============================================================================
 class BotStates:
     PHONE = "PHONE"
     CODE = "CODE"
@@ -492,6 +492,26 @@ class TelegramBotManager:
         self.token = token
         self.client = TelegramClient(str(AppConfig.SESSION_DIR / "bot.session"), settings.API_ID, settings.API_HASH)
         self.user_states: Dict[int, Dict] = {}
+        
+        # ==========================================
+        # تنظیمات جوین اجباری (Force Join)
+        # یوزرنیم کانال خود را بدون @ وارد کنید. مثلا: "ProShopChannel"
+        # اگر نمی‌خواهید جوین اجباری باشد، مقدار را خالی "" بگذارید.
+        self.required_channel = "ProShopChannel" 
+        # ==========================================
+
+    async def check_membership(self, user_id: int) -> bool:
+        """بررسی می‌کند که آیا کاربر در کانال مورد نظر عضو است یا خیر"""
+        if not self.required_channel:
+            return True
+            
+        try:
+            participant = await self.client.get_participant(self.required_channel, user_id)
+            # اگر کاربر عضو باشد یا ادمین باشد، خطا نمی‌دهد
+            return True
+        except Exception:
+            # اگر کاربر عضو نباشد یا کانال پیدا نشود
+            return False
 
     async def start(self):
         if not settings.ENABLE_BOT: return
@@ -503,12 +523,30 @@ class TelegramBotManager:
             @self.client.on(events.NewMessage(func=lambda e: e.is_private))
             async def handler(event):
                 if not event.is_private: return
+                
                 sender = await event.get_sender()
                 if sender.bot: return
                 
                 text = event.message.message.strip()
                 user_id = sender.id
 
+                # -----------------------------------------------------
+                # ۱. بررسی جوین اجباری قبل از انجام هر کاری
+                if not await self.check_membership(user_id):
+                    from telethon import Button
+                    channel_link = f"https://t.me/{self.required_channel}"
+                    await event.respond(
+                        "🔒 **Access Restricted**\n\n"
+                        "To use this bot, you must join our official channel first.\n"
+                        "Please join and then send /start again.",
+                        buttons=[
+                            [Button.url("📢 Join Channel", channel_link)]
+                        ]
+                    )
+                    return # جلوی ادامه کار کاربر گرفته می‌شود
+                # -----------------------------------------------------
+
+                # ۲. مدیریت دستورات
                 if text == '/start':
                     await self.cmd_start(event, user_id)
                     return
@@ -518,10 +556,17 @@ class TelegramBotManager:
                 elif text == '/setmenu':
                     await self.cmd_set_menu(event, user_id)
                     return
+                elif text == '/status':
+                    await self.cmd_status(event, user_id)
+                    return
+                elif text == '/help':
+                    await self.cmd_help(event, user_id)
+                    return
 
+                # ۳. مدیریت وضعیت‌های احراز هویت
                 state_data = self.user_states.get(user_id)
                 if not state_data:
-                    await event.respond("Please send /start to begin.")
+                    await event.respond("⚠️ Session expired or not started. Please send /start to begin.")
                     return
 
                 if state_data["state"] == BotStates.PHONE:
@@ -554,33 +599,19 @@ class TelegramBotManager:
     async def cmd_start(self, event, user_id: int):
         self.user_states[user_id] = {"state": BotStates.PHONE}
         
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
         web_app_url = "https://python-api-1-c4y7.onrender.com/" 
         
-        from telethon import Button
-        await event.respond(
-            "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n",
-            buttons=[
-                [Button.web_app("🚀 Open Mini App", web_app_url)]
-            ]
-        )
-    async def cmd_start(self, event, user_id: int):
-        self.user_states[user_id] = {"state": BotStates.PHONE}
-        
-        # آدرس وب‌سایت شما (حتماً باید با https:// شروع شود)
-        web_app_url = "https://python-api-1-c4y7.onrender.com/" 
-        
-        # استفاده از KeyboardButtonWebView برای سازگاری با تمام نسخه‌های Telethon
         from telethon.tl.types import KeyboardButtonWebView
         
         await event.respond(
             "👋 **Welcome to Pro Shop Auth Bot!**\n\n"
-            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n",
+            "You can authenticate either by chatting here, or click the button below to open the secure Web App.\n\n"
+            "💡 **Tip:** Send `/setmenu` to add a permanent Mini App button to your chat menu.",
             buttons=[
                 [KeyboardButtonWebView(text="🚀 Open Mini App", url=web_app_url)]
             ]
         )
+
     async def cmd_cancel(self, event, user_id: int):
         if user_id in self.user_states:
             state = self.user_states[user_id]
@@ -589,6 +620,19 @@ class TelegramBotManager:
                 except: pass
             del self.user_states[user_id]
         await event.respond("❌ Operation cancelled. Send /start to begin again.")
+
+    async def cmd_status(self, event, user_id: int):
+        state = self.user_states.get(user_id, {}).get("state", "NONE")
+        await event.respond(f"📊 **System Status**\n\nCurrent State: `{state}`\nBot Status: `Online`")
+
+    async def cmd_help(self, event, user_id: int):
+        await event.respond(
+            "ℹ️ **Help & Commands**\n\n"
+            "/start - Begin authentication or open Web App\n"
+            "/cancel - Cancel current operation\n"
+            "/setmenu - Add Mini App button to chat menu\n"
+            "/status - Check your current session state"
+        )
 
     async def handle_phone(self, event, user_id: int, text: str):
         phone = SecurityUtils.sanitize_phone(text)
