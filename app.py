@@ -498,8 +498,9 @@ class TelegramBotManager:
         # اگر نمی‌خواهید جوین اجباری باشد، لیست را خالی بگذارید: []
         self.required_channels = [
             "ProShopChannel", 
-            "ProShopNews",
-            "ProShopSupport"
+            "ImHormuz",
+            "ApaserNetwork",
+            "ParaRta"
         ] 
         # ==========================================
 
