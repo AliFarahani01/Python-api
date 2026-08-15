@@ -87,7 +87,7 @@ class Settings(BaseSettings):
 
     # Server
     HOST: str = "0.0.0.0"
-    PORT: int = 8000
+    PORT: int = int(os.getenv("PORT", 8000))  # Render compatible
 
     # Session limits
     MAX_SESSIONS: int = 10000
@@ -299,7 +299,6 @@ async def rate_limit_dependency(request: Request):
 class DatabaseManager:
     def __init__(self, db_path: Path):
         self.db_path = db_path
-        self._pool = None
 
     async def init_db(self):
         """Initialize database tables and indexes."""
@@ -887,7 +886,7 @@ class TelegramBotManager:
     async def cmd_start(self, event, user_id: int):
         self.user_states[user_id] = {"state": BotStates.PHONE}
 
-        web_app_url = "https://your-domain.com"  # Replace with actual URL
+        web_app_url = os.getenv("WEBAPP_URL", "https://your-domain.com")
 
         # Build inline keyboard with WebApp and other options
         buttons = [
